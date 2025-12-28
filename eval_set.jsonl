@@ -1,0 +1,10 @@
+{"query":"Хто директор ІКНІ?","must_contain_url":"lpnu.ua/ikni/kerivnytstvo-instytutu"}
+{"query":"Хто входить в керівництво ІКНІ?","must_contain_url":"lpnu.ua/ikni/kerivnytstvo-instytutu"}
+{"query":"Коли створено ІКНІ?","must_contain_text":"19 жовтня 2001"}
+{"query":"Яка історія ІКНІ?","must_contain_url":"lpnu.ua/ikni/istoriia-instytutu"}
+{"query":"Які партнери інституту?","must_contain_url":"lpnu.ua/ikni/partnery-instytutu"}
+{"query":"Що нового в Telegram каналі pbikni?","must_contain_type":"tg"}
+{"query":"Колегія та профбюро ІКНІ","must_contain_url":"lpnu.ua/ikni/kolehiia-ta-profbiuro-studentiv-instytutu"}
+{"query":"Вчена рада ІКНІ","must_contain_url":"lpnu.ua/ikni/vchena-rada-instytutu"}
+{"query":"Інформація вступнику ІКНІ","must_contain_url":"lpnu.ua/ikni/vstupnyku-ikni"}
+{"query":"Яка ознайомча інформація про інститут?","must_contain_url":"lpnu.ua/ikni/oznaiomcha-informatsiia-pro-instytut"}

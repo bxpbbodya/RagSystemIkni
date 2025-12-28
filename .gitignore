@@ -1,27 +1,28 @@
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
+*.log
+
+# venv
 .venv/
 venv/
-env/
 
-# Streamlit
-.streamlit/
+# IDE
+.idea/
+.vscode/
 
-# Local data (do not push)
-data/
-local_cache.jsonl
-*.index
-*.faiss
-faiss.index
-faiss_meta.jsonl
+# Streamlit secrets
+.streamlit/secrets.toml
 
-# Telegram session (do not leak)
-*.session
-*.session-journal
+# Local data / caches
+data/*.session
+data/*.session-journal
+data/local_cache.jsonl
+data/*.faiss
+data/index*.jsonl
+report/
+*.zip
 
-# OS
-.DS_Store
-Thumbs.db
+# Env keys
+.env
+.env.*

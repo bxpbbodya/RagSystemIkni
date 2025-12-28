@@ -3,10 +3,17 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Set
+import json
+import zipfile
 
 import streamlit as st
 import pandas as pd
+
+# matplotlib safe backend (important for Windows / streamlit)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from core.config import CONFIG
 from core.index import load_faiss_index, build_faiss_index, load_chunks_from_jsonl
@@ -73,7 +80,6 @@ def _init_state():
         "tg_phone": "",
         "tg_code": "",
         "tg_2fa": "",
-        "tg_auth_status": "unknown",
         # LLM
         "llm_enabled": False,
         "llm_provider": "openai",
@@ -82,9 +88,13 @@ def _init_state():
         "llm_base_url": "",
         "llm_temperature": 0.2,
         "llm_debug": False,
+        "use_custom_model": False,
         # UI
         "quick_query": "",
-        "use_custom_model": False,
+        # Eval
+        "last_eval_metrics": None,
+        "last_eval_df": None,
+        "last_eval_plots_dir": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -203,6 +213,205 @@ def _normalize_channel(channel: str) -> str:
 
 
 # -----------------------------
+# EVAL helpers
+# -----------------------------
+def _load_eval_set(path: Path) -> List[dict]:
+    if not path.exists():
+        return []
+    items = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        items.append(json.loads(line))
+    return items
+
+
+def _is_hit(chunk, rule: dict) -> bool:
+    url = (chunk.url or "").lower()
+    title = (chunk.title or "").lower()
+    stype = (chunk.source_type or "").lower()
+    text = (chunk.text or "").lower()
+
+    must_url = (rule.get("must_contain_url") or "").lower()
+    must_type = (rule.get("must_contain_type") or "").lower()
+    must_text = (rule.get("must_contain_text") or "").lower()
+
+    if must_url and must_url not in url:
+        return False
+    if must_type and must_type != stype:
+        return False
+    if must_text and must_text not in text and must_text not in title:
+        return False
+    return True
+
+
+def _save_eval_plots(df: pd.DataFrame, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Hit ratio pie
+    hit_counts = df["hit"].value_counts()
+    plt.figure()
+    hit_counts.plot(kind="pie", autopct="%1.1f%%")
+    plt.title("Evaluation: Hit ratio")
+    plt.ylabel("")
+    plt.tight_layout()
+    plt.savefig(out_dir / "hit_ratio.png", dpi=200)
+    plt.close()
+
+    # 2) Rank histogram
+    plt.figure()
+    df_hits = df[df["hit"] == True]
+    if not df_hits.empty:
+        df_hits["hit_rank"].value_counts().sort_index().plot(kind="bar")
+        plt.title("Hit rank distribution")
+        plt.xlabel("Rank of first relevant source")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(out_dir / "hit_rank_hist.png", dpi=200)
+    plt.close()
+
+    # 3) Top1 score hist
+    plt.figure()
+    df["top1_score"].dropna().plot(kind="hist", bins=10)
+    plt.title("Top-1 similarity score distribution")
+    plt.xlabel("Score")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.savefig(out_dir / "top1_score_hist.png", dpi=200)
+    plt.close()
+
+
+def run_retrieval_eval(top_k: int = 5) -> dict:
+    from core.index import search_index
+
+    eval_path = Path("eval_set.jsonl")
+    eval_set = _load_eval_set(eval_path)
+    if not eval_set:
+        return {"ok": False, "error": "eval_set.jsonl not found or empty."}
+
+    index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
+
+    hits = 0
+    rr_sum = 0.0
+    rows = []
+
+    for ex in eval_set:
+        query = ex["query"]
+
+        results = search_index(
+            query=query,
+            index=index,
+            chunks=meta,
+            embed_model_name=CONFIG.embed_model_name,
+            top_k=top_k,
+        )
+
+        hit_rank = None
+        rel_count = 0
+
+        for i, (chunk, score) in enumerate(results, start=1):
+            if _is_hit(chunk, ex):
+                rel_count += 1
+                if hit_rank is None:
+                    hit_rank = i
+
+        hit = hit_rank is not None
+        if hit:
+            hits += 1
+            rr_sum += 1.0 / hit_rank
+
+        precision = rel_count / top_k if top_k else 0.0
+
+        rows.append({
+            "query": query,
+            "hit": hit,
+            "hit_rank": hit_rank,
+            "precision@k": round(precision, 4),
+            "top1_score": float(results[0][1]) if results else None,
+            "top1_url": results[0][0].url if results else None,
+            "top1_type": results[0][0].source_type if results else None,
+        })
+
+    n = len(eval_set)
+    recall = hits / n if n else 0
+    mrr = rr_sum / n if n else 0
+    avg_prec = sum(r["precision@k"] for r in rows) / n if n else 0
+
+    df = pd.DataFrame(rows)
+
+    # save to report folder (so you can insert in Word)
+    report_dir = Path("report")
+    plots_dir = report_dir / "plots"
+    report_dir.mkdir(exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    df.to_csv(report_dir / "eval_results.csv", index=False, encoding="utf-8")
+    metrics = {
+        "n": n,
+        "top_k": top_k,
+        "recall_at_k": recall,
+        "mrr_at_k": mrr,
+        "avg_precision_at_k": avg_prec,
+    }
+    (report_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # create plots
+    _save_eval_plots(df, plots_dir)
+
+    return {"ok": True, "metrics": metrics, "df": df, "plots_dir": str(plots_dir)}
+
+
+def dataset_stats_from_cache(cache_path: Path) -> dict:
+    """
+    Returns:
+      - counts by source_type
+      - counts by date
+    """
+    if not cache_path.exists():
+        return {"ok": False, "error": "local_cache.jsonl not found"}
+
+    types: dict = {}
+    dates: dict = {}
+
+    with cache_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            stype = obj.get("source_type", "other")
+            types[stype] = types.get(stype, 0) + 1
+            d = obj.get("date")
+            if d:
+                dates[d] = dates.get(d, 0) + 1
+
+    return {"ok": True, "types": types, "dates": dates}
+
+
+def export_report_zip() -> Optional[Path]:
+    """
+    Creates report/report_package.zip containing:
+      - metrics.json
+      - eval_results.csv
+      - plots/*.png
+    """
+    report_dir = Path("report")
+    if not report_dir.exists():
+        return None
+
+    zip_path = report_dir / "report_package.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in report_dir.rglob("*"):
+            if p.is_dir():
+                continue
+            if p.name.endswith(".zip"):
+                continue
+            z.write(p, arcname=str(p.relative_to(report_dir)))
+    return zip_path
+
+
+# -----------------------------
 # Sidebar
 # -----------------------------
 st.sidebar.title("⚙️ Налаштування")
@@ -263,13 +472,13 @@ with st.sidebar.expander("📡 Telegram інтеграція (Auth + Sync)", exp
     send_code_btn = colA.button("📨 Надіслати код", disabled=not st.session_state.online_mode)
     sign_in_btn = colB.button("✅ Підтвердити код", disabled=not st.session_state.online_mode)
 
-    # async actions
     if send_code_btn:
         if not api_id_int or not api_hash_str or not st.session_state.tg_phone.strip():
             st.error("Вкажи api_id, api_hash і номер телефону.")
         else:
             try:
                 from telethon import TelegramClient
+
                 async def _send_code():
                     async with TelegramClient("data/tg_session", api_id_int, api_hash_str) as client:
                         await client.send_code_request(st.session_state.tg_phone.strip())
@@ -311,7 +520,6 @@ with st.sidebar.expander("📡 Telegram інтеграція (Auth + Sync)", exp
             except Exception as e:
                 st.error(f"❌ Авторизація не вдалася: {e}")
 
-    # session status
     st.divider()
     st.subheader("🧪 Test Telegram (last 3 msgs)")
 
@@ -512,7 +720,6 @@ if st.sidebar.button("🛠️ Побудувати індекс з local_cache.j
         except Exception as e:
             st.sidebar.error(f"Помилка побудови індексу: {e}")
 
-
 # -----------------------------
 # Sync knowledge base
 # -----------------------------
@@ -553,7 +760,6 @@ with st.sidebar.expander("🧨 Advanced: wipe local storage", expanded=False):
         else:
             st.error("❌ Не вдалося видалити всі файли (можуть бути відкриті).")
 
-
 # -----------------------------
 # Safety / reset
 # -----------------------------
@@ -572,6 +778,9 @@ if st.sidebar.button("🧨 Повний скидання (очистити UI + 
     st.session_state.tg_2fa = ""
     st.session_state.llm_api_key = ""
     st.session_state.last_sync_report = None
+    st.session_state.last_eval_metrics = None
+    st.session_state.last_eval_df = None
+    st.session_state.last_eval_plots_dir = None
     st.success("Сесія очищена (без видалення файлів).")
 
 
@@ -602,84 +811,203 @@ if st.session_state.last_sync_report:
     with st.expander("📄 Останній Sync report", expanded=False):
         st.json(st.session_state.last_sync_report)
 
-# Quick presets
-st.subheader("⚡ Швидкі запити")
-qcol1, qcol2, qcol3, qcol4 = st.columns(4)
-if qcol1.button("Хто директор ІКНІ?"):
-    st.session_state.quick_query = "Хто директор ІКНІ?"
-if qcol2.button("Коли створено ІКНІ?"):
-    st.session_state.quick_query = "Коли створено ІКНІ?"
-if qcol3.button("Керівництво ІКНІ"):
-    st.session_state.quick_query = "Хто входить в керівництво ІКНІ?"
-if qcol4.button("Що нового в pbikni?"):
-    st.session_state.quick_query = "Що нового в Telegram каналі pbikni?"
 
-default_query = st.session_state.get("quick_query", "")
+tab_chat, tab_eval = st.tabs(["💬 Chat / Search", "📊 Metrics & Evaluation"])
 
-col1, col2 = st.columns([2, 1], gap="large")
 
-with col1:
-    st.subheader("🔎 Запит")
+# =============================
+# TAB 1: Chat / Search
+# =============================
+with tab_chat:
+    st.subheader("⚡ Швидкі запити")
+    qcol1, qcol2, qcol3, qcol4 = st.columns(4)
+    if qcol1.button("Хто директор ІКНІ?"):
+        st.session_state.quick_query = "Хто директор ІКНІ?"
+    if qcol2.button("Коли створено ІКНІ?"):
+        st.session_state.quick_query = "Коли створено ІКНІ?"
+    if qcol3.button("Керівництво ІКНІ"):
+        st.session_state.quick_query = "Хто входить в керівництво ІКНІ?"
+    if qcol4.button("Що нового в pbikni?"):
+        st.session_state.quick_query = "Що нового в Telegram каналі pbikni?"
 
-    query = st.text_input("Введи питання", value=default_query)
-    top_k = st.slider("Top-K джерел", min_value=1, max_value=10, value=CONFIG.top_k)
+    default_query = st.session_state.get("quick_query", "")
 
-    use_llm = bool(st.session_state.online_mode and st.session_state.llm_enabled)
-    if use_llm:
-        st.caption(f"🤖 Генерація: **LLM ON** • provider=`{st.session_state.llm_provider}` • model=`{st.session_state.llm_model}`")
-    else:
-        st.caption("📌 Генерація: **LLM OFF** (offline summarizer)")
+    col1, col2 = st.columns([2, 1], gap="large")
 
-    ask_btn = st.button("Отримати відповідь", type="primary", use_container_width=True)
+    with col1:
+        st.subheader("🔎 Запит")
 
-    if ask_btn:
-        st.session_state.quick_query = ""  # reset
-        if not query.strip():
-            st.warning("Введи запит.")
-        elif not st.session_state.index_ready:
-            st.warning("Спершу завантаж або побудуй локальний FAISS індекс у сайдбарі.")
+        query = st.text_input("Введи питання", value=default_query)
+        top_k = st.slider("Top-K джерел", min_value=1, max_value=10, value=CONFIG.top_k)
+
+        use_llm = bool(st.session_state.online_mode and st.session_state.llm_enabled)
+        if use_llm:
+            st.caption(
+                f"🤖 Генерація: **LLM ON** • provider=`{st.session_state.llm_provider}` • model=`{st.session_state.llm_model}`"
+            )
         else:
-            from core.index import search_index
+            st.caption("📌 Генерація: **LLM OFF** (offline summarizer)")
 
-            index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
+        ask_btn = st.button("Отримати відповідь", type="primary", use_container_width=True)
 
-            results = search_index(
-                query=query,
-                index=index,
-                chunks=meta,
-                embed_model_name=CONFIG.embed_model_name,
-                top_k=top_k,
-            )
-            st.session_state.last_results = results
-
-            if use_llm:
-                llm = _build_llm_settings()
-                answer = make_answer_with_llm(query, results, llm)
+        if ask_btn:
+            st.session_state.quick_query = ""  # reset
+            if not query.strip():
+                st.warning("Введи запит.")
+            elif not st.session_state.index_ready:
+                st.warning("Спершу завантаж або побудуй локальний FAISS індекс у сайдбарі.")
             else:
-                answer = make_answer_no_llm(query, results)
+                from core.index import search_index
 
-            st.markdown(answer)
+                index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
 
-with col2:
-    st.subheader("📚 Джерела")
-    if not st.session_state.last_results:
-        st.info("Після запиту тут зʼявляться знайдені фрагменти (top-K).")
+                results = search_index(
+                    query=query,
+                    index=index,
+                    chunks=meta,
+                    embed_model_name=CONFIG.embed_model_name,
+                    top_k=top_k,
+                )
+                st.session_state.last_results = results
+
+                if use_llm:
+                    llm = _build_llm_settings()
+                    answer = make_answer_with_llm(query, results, llm)
+                else:
+                    answer = make_answer_no_llm(query, results)
+
+                st.markdown(answer)
+
+    with col2:
+        st.subheader("📚 Джерела")
+        if not st.session_state.last_results:
+            st.info("Після запиту тут зʼявляться знайдені фрагменти (top-K).")
+        else:
+            rows = []
+            for rank, (chunk, score) in enumerate(st.session_state.last_results, start=1):
+                rows.append(
+                    {
+                        "Rank": rank,
+                        "Score": round(score, 4),
+                        "Title": chunk.title,
+                        "Type": chunk.source_type,
+                        "Date": chunk.date,
+                        "URL": chunk.url,
+                        "Text (snippet)": (chunk.text[:180] + "…") if len(chunk.text) > 180 else chunk.text,
+                    }
+                )
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+# =============================
+# TAB 2: Metrics & Evaluation
+# =============================
+with tab_eval:
+    st.subheader("📊 Metrics & Evaluation")
+
+    st.write(
+        "Тут ти можеш оцінити якість **retrieval** (FAISS + embeddings) "
+        "на тестовому наборі `eval_set.jsonl`, та отримати графіки/метрики для вставки у звіт."
+    )
+
+    if not st.session_state.index_ready:
+        st.warning("⚠️ Індекс не завантажено. Спершу побудуй/завантаж індекс у сайдбарі.")
+
+    eval_col1, eval_col2 = st.columns([2, 1], gap="large")
+
+    with eval_col1:
+        st.markdown("### ✅ Retrieval evaluation (Recall / MRR / Precision)")
+        eval_k = st.slider("Evaluation K (top-K)", min_value=1, max_value=10, value=5)
+
+        if not Path("eval_set.jsonl").exists():
+            st.error("Файл `eval_set.jsonl` не знайдено. Додай його у корінь проєкту.")
+            st.caption("Формат: JSONL, кожен рядок: {query, must_contain_url | must_contain_type | must_contain_text}.")
+        else:
+            run_btn = st.button("🚀 Run evaluation", type="primary", use_container_width=True)
+
+            if run_btn:
+                if not st.session_state.index_ready:
+                    st.error("Спершу завантаж/побудуй індекс.")
+                else:
+                    with st.spinner("Оцінювання retrieval..."):
+                        out = run_retrieval_eval(top_k=eval_k)
+
+                    if not out.get("ok"):
+                        st.error(out.get("error"))
+                    else:
+                        st.session_state.last_eval_metrics = out["metrics"]
+                        st.session_state.last_eval_df = out["df"]
+                        st.session_state.last_eval_plots_dir = out["plots_dir"]
+                        st.success("✅ Готово! Результати збережено у `report/` (CSV + JSON + PNG).")
+
+        # show last eval results if exists
+        if st.session_state.last_eval_metrics:
+            m = st.session_state.last_eval_metrics
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Recall@K", f"{m['recall_at_k']:.3f}")
+            c2.metric("MRR@K", f"{m['mrr_at_k']:.3f}")
+            c3.metric("Avg Precision@K", f"{m['avg_precision_at_k']:.3f}")
+
+        if isinstance(st.session_state.last_eval_df, pd.DataFrame):
+            st.markdown("### 📋 Evaluation table")
+            st.dataframe(st.session_state.last_eval_df, use_container_width=True, hide_index=True)
+
+    with eval_col2:
+        st.markdown("### 📈 Plots")
+        if st.session_state.last_eval_plots_dir:
+            plots_dir = Path(st.session_state.last_eval_plots_dir)
+            p1 = plots_dir / "hit_ratio.png"
+            p2 = plots_dir / "hit_rank_hist.png"
+            p3 = plots_dir / "top1_score_hist.png"
+
+            if p1.exists():
+                st.image(str(p1), caption="Hit ratio (Recall@K visual)")
+            if p2.exists():
+                st.image(str(p2), caption="Hit rank distribution (MRR insight)")
+            if p3.exists():
+                st.image(str(p3), caption="Top-1 similarity score distribution")
+        else:
+            st.info("Запусти evaluation, щоб тут з’явилися графіки.")
+
+    st.divider()
+
+    st.markdown("### 📦 Dataset statistics (local_cache.jsonl)")
+    stats = dataset_stats_from_cache(Path(CONFIG.local_cache_path))
+    if not stats.get("ok"):
+        st.warning(stats.get("error"))
     else:
-        rows = []
-        for rank, (chunk, score) in enumerate(st.session_state.last_results, start=1):
-            rows.append(
-                {
-                    "Rank": rank,
-                    "Score": round(score, 4),
-                    "Title": chunk.title,
-                    "Type": chunk.source_type,
-                    "Date": chunk.date,
-                    "URL": chunk.url,
-                    "Text (snippet)": (chunk.text[:180] + "…") if len(chunk.text) > 180 else chunk.text,
-                }
-            )
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        types = stats["types"]
+        dates = stats["dates"]
+
+        st.write("**Chunks by source_type**")
+        df_types = pd.DataFrame([{"source_type": k, "chunks": v} for k, v in types.items()])
+        st.dataframe(df_types, use_container_width=True, hide_index=True)
+        st.bar_chart(df_types.set_index("source_type"))
+
+        if dates:
+            st.write("**Chunks by date**")
+            df_dates = pd.DataFrame([{"date": k, "chunks": v} for k, v in dates.items()]).sort_values("date")
+            st.line_chart(df_dates.set_index("date"))
+
+    st.divider()
+
+    st.markdown("### 📦 Export for report (ZIP)")
+    st.caption("Формує ZIP з `report/metrics.json`, `report/eval_results.csv`, `report/plots/*.png`.")
+    if st.button("📥 Export report package (ZIP)"):
+        zp = export_report_zip()
+        if not zp:
+            st.error("Немає папки report/ або файлів. Спершу запусти evaluation.")
+        else:
+            st.success("✅ ZIP сформовано!")
+            with open(zp, "rb") as f:
+                st.download_button(
+                    label="⬇️ Download report_package.zip",
+                    data=f,
+                    file_name="report_package.zip",
+                    mime="application/zip",
+                )
+
 
 st.divider()
 
@@ -708,5 +1036,5 @@ if Path(CONFIG.local_cache_path).exists():
 
 st.caption(
     "Порада: Online mode → Telegram Auth → Sync → тестові запити. "
-    "LLM робить відповідь структурованою, але офлайн теж працює."
+    "Оцінювання (Metrics tab) дає метрики + графіки для звіту."
 )
