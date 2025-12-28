@@ -1,0 +1,13 @@
+streamlit==1.39.0
+numpy==1.26.4
+pandas==2.2.3
+
+faiss-cpu==1.8.0.post1
+sentence-transformers==3.1.1
+
+python-dotenv==1.0.1
+requests==2.32.3
+beautifulsoup4==4.12.3
+trafilatura==1.12.2
+lxml==5.3.0
+telethon==1.36.0

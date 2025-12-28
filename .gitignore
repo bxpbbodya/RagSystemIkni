@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/
+
+# Local data (do not push)
+data/
+local_cache.jsonl
+*.index
+*.faiss
+faiss.index
+faiss_meta.jsonl
+
+# Telegram session (do not leak)
+*.session
+*.session-journal
+
+# OS
+.DS_Store
+Thumbs.db
