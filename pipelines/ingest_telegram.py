@@ -56,6 +56,9 @@ def _safe_text(msg: Message) -> str:
     if txt:
         return txt
     if getattr(msg, "media", None):
+        cap = (getattr(msg, "message", None) or "").strip()
+        if cap:
+            return cap
         return "[Media пост без тексту]"
     return ""
 
@@ -215,6 +218,7 @@ async def ingest_telegram_channel(
                     "has_media": bool(getattr(msg, "media", None)),
                     "is_pinned": bool(getattr(msg, "pinned", False)),
                     "is_forward": bool(getattr(msg, "fwd_from", None)),
+                    "doc_id": mk,
                 }
 
                 chunks: List[SourceChunk] = make_chunks_from_doc(

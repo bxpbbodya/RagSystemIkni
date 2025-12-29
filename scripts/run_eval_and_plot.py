@@ -121,6 +121,7 @@ def save_plots(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close()
 
 
+
 def main():
     eval_path = Path("eval_set.jsonl")
     if not eval_path.exists():
@@ -131,7 +132,10 @@ def main():
         line = line.strip()
         if not line:
             continue
-        eval_set.append(json.loads(line))
+        try:
+            eval_set.append(json.loads(line))
+        except Exception:
+            continue
 
     report_dir = Path("report")
     plots_dir = report_dir / "plots"
@@ -140,14 +144,31 @@ def main():
     out = evaluate(eval_set, top_k=5)
     df = pd.DataFrame(out["rows"])
 
+    # ✅ EXTRA METRICS
+    hit1 = float((df["hit_rank"] == 1).mean())
+    hit3 = float((df["hit_rank"].fillna(999) <= 3).mean())
+    hit5 = float((df["hit_rank"].fillna(999) <= 5).mean())
+
+    mean_top1 = float(df["top1_score"].dropna().mean()) if df["top1_score"].notna().any() else None
+    median_top1 = float(df["top1_score"].dropna().median()) if df["top1_score"].notna().any() else None
+
     # save metrics
     metrics = {
         "n": out["n"],
         "top_k": out["top_k"],
         "recall_at_k": out["recall_at_k"],
         "mrr_at_k": out["mrr_at_k"],
+        "hit_at_1": hit1,
+        "hit_at_3": hit3,
+        "hit_at_5": hit5,
+        "top1_score_mean": mean_top1,
+        "top1_score_median": median_top1,
     }
-    (report_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    (report_dir / "metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     df.to_csv(report_dir / "eval_results.csv", index=False, encoding="utf-8")
 
     save_plots(df, plots_dir)

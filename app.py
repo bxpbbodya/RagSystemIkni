@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import List, Optional, Dict, Any, Tuple
 import json
 import zipfile
 
@@ -17,17 +17,128 @@ import matplotlib.pyplot as plt
 
 from core.config import CONFIG
 from core.index import load_faiss_index, build_faiss_index, load_chunks_from_jsonl
-from core.rag import make_answer_no_llm, make_answer_with_llm
 from core.security import mask_secret
 from core.llm import LLMSettings, chat_completion, build_base_url
 
+# ✅ NEW structured answer API
+from core.rag import (
+    make_answer_no_llm_struct,
+    make_answer_with_llm_struct,
+)
 
+# Optional reranker
+try:
+    from core.rerank import rerank_results
+    RERANK_AVAILABLE = True
+except Exception:
+    rerank_results = None
+    RERANK_AVAILABLE = False
+
+FEEDBACK_PATH = Path("data/feedback.jsonl")
+
+
+# ==========================================================
+# Page config
+# ==========================================================
 st.set_page_config(page_title=CONFIG.project_name, layout="wide")
 
 
-# -----------------------------
+# ==========================================================
+# Safe JSONL helpers (DO NOT CRASH on broken lines)
+# ==========================================================
+def safe_read_jsonl(path: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = (line or "").strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    # skip broken line
+                    continue
+    except Exception:
+        return []
+
+    if limit is not None and limit > 0:
+        return rows[-limit:]
+    return rows
+
+
+def safe_append_jsonl(path: Path, item: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# ==========================================================
+# Feedback
+# ==========================================================
+def _append_feedback(entry: dict) -> None:
+    safe_append_jsonl(FEEDBACK_PATH, entry)
+
+
+def _feedback_payload(rating: int, comment: str = "") -> dict:
+    query = st.session_state.get("last_query", "")
+    ans = st.session_state.get("last_answer_struct")
+    results = st.session_state.get("last_results", [])
+
+    answer_text = ""
+    used_sources: List[int] = []
+    warnings: List[str] = []
+
+    if ans:
+        answer_text = (getattr(ans, "markdown", "") or "")[:1200]
+        used_sources = list(getattr(ans, "used_sources", []) or [])
+        warnings = list(getattr(ans, "warnings", []) or [])
+
+    sources = []
+    for rank, (chunk, score) in enumerate(results[:10], start=1):
+        extra = chunk.extra or {}
+        sources.append({
+            "rank": rank,
+            "score": float(score),
+            "title": chunk.title,
+            "url": chunk.url,
+            "source_type": chunk.source_type,
+            "date": chunk.date,
+            "chunk_id": chunk.chunk_id,
+            "doc_id": extra.get("doc_id"),
+        })
+
+    payload = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "rating": int(rating),
+        "comment": (comment or "").strip(),
+        "query": query,
+        "answer_snippet": answer_text,
+        "used_sources": used_sources,
+        "warnings": warnings,
+        "retrieval_sources": sources,
+        "online_mode": bool(st.session_state.get("online_mode")),
+        "llm_enabled": bool(st.session_state.get("llm_enabled")),
+        "llm_provider": st.session_state.get("llm_provider"),
+        "llm_model": st.session_state.get("llm_model"),
+        "reranker_enabled": bool(st.session_state.get("use_reranker_ui")),
+        "min_score": float(st.session_state.get("min_score", 0.0)),
+        "keyword_filter": bool(st.session_state.get("keyword_filter", True)),
+        "doc_scope_enabled": bool(st.session_state.get("doc_scope_enabled", False)),
+        "doc_scope_ids": sorted(list(st.session_state.get("doc_scope_ids", set()) or [])),
+    }
+    return payload
+
+
+# ==========================================================
 # Model presets
-# -----------------------------
+# ==========================================================
 MODEL_PRESETS = {
     "openai": [
         "gpt-4o-mini",
@@ -55,31 +166,24 @@ MODEL_PRESETS = {
     ],
     "custom": [],
 }
-
 PROVIDERS = ["openai", "groq", "openrouter", "ollama", "custom"]
 
 
-# -----------------------------
-# Session state init
-# -----------------------------
+# ==========================================================
+# Session state
+# ==========================================================
 def _init_state():
     defaults = {
-        # VNS
-        "vns_login": "",
-        "vns_password": "",
         # Online mode
         "online_mode": True,
-        # RAG
-        "last_results": [],
+
+        # RAG state
         "index_ready": False,
+        "last_results": [],
+        "last_answer_struct": None,
+        "last_query": "",
         "last_sync_report": None,
-        # Telegram
-        "tg_api_id": "",
-        "tg_api_hash": "",
-        "tg_channels": "pbikni",
-        "tg_phone": "",
-        "tg_code": "",
-        "tg_2fa": "",
+
         # LLM
         "llm_enabled": False,
         "llm_provider": "openai",
@@ -89,13 +193,55 @@ def _init_state():
         "llm_temperature": 0.2,
         "llm_debug": False,
         "use_custom_model": False,
-        # UI
+
+        # Retrieval tuning
+        "min_score": 0.35,
+        "keyword_filter": True,
+        "show_retrieval_debug": False,
+
+        # Reranker
+        "use_reranker_ui": bool(getattr(CONFIG, "use_reranker", False)) and RERANK_AVAILABLE,
+        "reranker_model_ui": getattr(CONFIG, "reranker_model_name", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+        "reranker_top_n_ui": int(getattr(CONFIG, "reranker_top_n", 30)),
+
+        # Source filters
+        "filter_lpnu": True,
+        "filter_tg": True,
+        "filter_vns": True,
+        "filter_local": True,
+
+        # Document scope (local uploads)
+        "doc_scope_enabled": False,
+        "doc_scope_ids": set(),
+
+        # Answer UI
+        "show_used_sources_only": False,
+        "show_chunk_preview": True,
+
+        # quick query
         "quick_query": "",
-        # Eval
+
+        # Feedback
+        "feedback_comment": "",
+
+        # Telegram
+        "tg_api_id": "",
+        "tg_api_hash": "",
+        "tg_channels": "pbikni",
+        "tg_phone": "",
+        "tg_code": "",
+        "tg_2fa": "",
+
+        # VNS (UI only)
+        "vns_login": "",
+        "vns_password": "",
+
+        # Eval state
         "last_eval_metrics": None,
         "last_eval_df": None,
         "last_eval_plots_dir": None,
     }
+
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -104,24 +250,30 @@ def _init_state():
 _init_state()
 
 
-# -----------------------------
+# ==========================================================
 # Helpers
-# -----------------------------
-def _parse_tg_channels(raw: str) -> List[str]:
-    chans: List[str] = []
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        chans.append(line)
-    return chans
-
-
+# ==========================================================
 def _safe_int(x: str) -> Optional[int]:
     try:
         return int(x)
     except Exception:
         return None
+
+
+def _parse_tg_channels(raw: str) -> List[str]:
+    chans: List[str] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if line:
+            chans.append(line)
+    return chans
+
+
+def _normalize_channel(channel: str) -> str:
+    ch = (channel or "").strip()
+    ch = ch.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
+    ch = ch.strip("@").strip("/").strip()
+    return ch
 
 
 def _maybe_load_index() -> None:
@@ -143,9 +295,9 @@ def _build_llm_settings() -> LLMSettings:
     return LLMSettings(
         enabled=bool(st.session_state.llm_enabled and st.session_state.online_mode),
         provider=st.session_state.llm_provider,
-        model=st.session_state.llm_model.strip(),
-        api_key=st.session_state.llm_api_key.strip(),
-        base_url=st.session_state.llm_base_url.strip() or None,
+        model=(st.session_state.llm_model or "").strip(),
+        api_key=(st.session_state.llm_api_key or "").strip(),
+        base_url=(st.session_state.llm_base_url or "").strip() or None,
         temperature=float(st.session_state.llm_temperature),
         max_tokens=650,
     )
@@ -160,9 +312,7 @@ def _ensure_valid_model_for_provider(provider: str) -> None:
     presets = MODEL_PRESETS.get(provider) or []
     if provider == "custom":
         return
-    if not presets:
-        return
-    if st.session_state.llm_model not in presets:
+    if presets and st.session_state.llm_model not in presets:
         st.session_state.llm_model = presets[0]
 
 
@@ -176,9 +326,6 @@ def _delete_file_silent(p: Path) -> bool:
 
 
 def _wipe_local_storage() -> dict:
-    """
-    Delete local_cache + index files (for clean tests).
-    """
     ok = True
     ok &= _delete_file_silent(Path(CONFIG.local_cache_path))
     ok &= _delete_file_silent(Path(CONFIG.faiss_index_path))
@@ -186,14 +333,28 @@ def _wipe_local_storage() -> dict:
     return {"ok": ok}
 
 
-# -------- Telegram async helpers (SAFE for Streamlit) ----------
-def _run_async(coro, timeout_sec: int = 25):
-    """
-    Runs coroutine with a timeout in a fresh loop.
-    Prevents Streamlit from hanging forever.
-    """
-    import asyncio
+def export_report_zip() -> Optional[Path]:
+    report_dir = Path("report")
+    if not report_dir.exists():
+        return None
 
+    zip_path = report_dir / "report_package.zip"
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in report_dir.rglob("*"):
+                if p.is_dir():
+                    continue
+                if p.name.endswith(".zip"):
+                    continue
+                z.write(p, arcname=str(p.relative_to(report_dir)))
+        return zip_path
+    except Exception:
+        return None
+
+
+# -------- Telegram async runner ----------
+def _run_async(coro, timeout_sec: int = 25):
+    import asyncio
     try:
         return asyncio.run(asyncio.wait_for(coro, timeout=timeout_sec))
     except RuntimeError:
@@ -205,25 +366,11 @@ def _run_async(coro, timeout_sec: int = 25):
             loop.close()
 
 
-def _normalize_channel(channel: str) -> str:
-    ch = (channel or "").strip()
-    ch = ch.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
-    ch = ch.strip("@").strip("/").strip()
-    return ch
-
-
-# -----------------------------
-# EVAL helpers
-# -----------------------------
+# ==========================================================
+# Evaluation helpers (FIXED metrics + no undefined vars)
+# ==========================================================
 def _load_eval_set(path: Path) -> List[dict]:
-    if not path.exists():
-        return []
-    items = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        items.append(json.loads(line))
+    items = safe_read_jsonl(path)
     return items
 
 
@@ -249,7 +396,6 @@ def _is_hit(chunk, rule: dict) -> bool:
 def _save_eval_plots(df: pd.DataFrame, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Hit ratio pie
     hit_counts = df["hit"].value_counts()
     plt.figure()
     hit_counts.plot(kind="pie", autopct="%1.1f%%")
@@ -259,7 +405,6 @@ def _save_eval_plots(df: pd.DataFrame, out_dir: Path) -> None:
     plt.savefig(out_dir / "hit_ratio.png", dpi=200)
     plt.close()
 
-    # 2) Rank histogram
     plt.figure()
     df_hits = df[df["hit"] == True]
     if not df_hits.empty:
@@ -271,7 +416,6 @@ def _save_eval_plots(df: pd.DataFrame, out_dir: Path) -> None:
         plt.savefig(out_dir / "hit_rank_hist.png", dpi=200)
     plt.close()
 
-    # 3) Top1 score hist
     plt.figure()
     df["top1_score"].dropna().plot(kind="hist", bins=10)
     plt.title("Top-1 similarity score distribution")
@@ -282,7 +426,7 @@ def _save_eval_plots(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close()
 
 
-def run_retrieval_eval(top_k: int = 5) -> dict:
+def run_retrieval_eval(top_k: int = 5, use_reranker: bool = False) -> dict:
     from core.index import search_index
 
     eval_path = Path("eval_set.jsonl")
@@ -293,21 +437,42 @@ def run_retrieval_eval(top_k: int = 5) -> dict:
     index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
 
     hits = 0
+    hits_at_1 = 0
+    hits_at_3 = 0
+    hits_at_5 = 0
     rr_sum = 0.0
     rows = []
 
-    for ex in eval_set:
-        query = ex["query"]
+    internal_k = max(getattr(CONFIG, "internal_k_min", 30), top_k * getattr(CONFIG, "internal_k_multiplier", 8))
+    rerank_top_n = int(st.session_state.reranker_top_n_ui)
 
-        results = search_index(
+    for ex in eval_set:
+        query = ex.get("query", "")
+
+        candidates = search_index(
             query=query,
             index=index,
             chunks=meta,
             embed_model_name=CONFIG.embed_model_name,
             top_k=top_k,
+            internal_k=internal_k,
+            min_score=float(st.session_state.min_score),
+            keyword_filter=bool(st.session_state.keyword_filter),
         )
 
-        hit_rank = None
+        if use_reranker and RERANK_AVAILABLE:
+            results = rerank_results(
+                query=query,
+                results=candidates[:rerank_top_n],
+                model_name=st.session_state.reranker_model_ui,
+                top_k=top_k,
+            )
+            mode = "reranker"
+        else:
+            results = candidates[:top_k]
+            mode = "faiss"
+
+        hit_rank: Optional[int] = None
         rel_count = 0
 
         for i, (chunk, score) in enumerate(results, start=1):
@@ -319,9 +484,16 @@ def run_retrieval_eval(top_k: int = 5) -> dict:
         hit = hit_rank is not None
         if hit:
             hits += 1
-            rr_sum += 1.0 / hit_rank
+            rr_sum += 1.0 / float(hit_rank)
 
-        precision = rel_count / top_k if top_k else 0.0
+            if hit_rank <= 1:
+                hits_at_1 += 1
+            if hit_rank <= 3:
+                hits_at_3 += 1
+            if hit_rank <= 5:
+                hits_at_5 += 1
+
+        precision = rel_count / float(top_k) if top_k else 0.0
 
         rows.append({
             "query": query,
@@ -331,57 +503,76 @@ def run_retrieval_eval(top_k: int = 5) -> dict:
             "top1_score": float(results[0][1]) if results else None,
             "top1_url": results[0][0].url if results else None,
             "top1_type": results[0][0].source_type if results else None,
+            "mode": mode,
         })
 
     n = len(eval_set)
-    recall = hits / n if n else 0
-    mrr = rr_sum / n if n else 0
-    avg_prec = sum(r["precision@k"] for r in rows) / n if n else 0
+    recall = hits / n if n else 0.0
+    mrr = rr_sum / n if n else 0.0
+    avg_prec = sum(r["precision@k"] for r in rows) / n if n else 0.0
 
     df = pd.DataFrame(rows)
 
-    # save to report folder (so you can insert in Word)
+    # score stats
+    top1_scores = df["top1_score"].dropna()
+    mean_top1 = float(top1_scores.mean()) if not top1_scores.empty else None
+    median_top1 = float(top1_scores.median()) if not top1_scores.empty else None
+
+    metrics = {
+        "n": n,
+        "top_k": top_k,
+        "mode": mode,
+        "recall_at_k": recall,
+        "mrr_at_k": mrr,
+        "avg_precision_at_k": avg_prec,
+        "hit_at_1": hits_at_1 / n if n else 0.0,
+        "hit_at_3": hits_at_3 / n if n else 0.0,
+        "hit_at_5": hits_at_5 / n if n else 0.0,
+        "top1_score_mean": mean_top1,
+        "top1_score_median": median_top1,
+        "min_score": float(st.session_state.min_score),
+        "keyword_filter": bool(st.session_state.keyword_filter),
+        "reranker_model": st.session_state.reranker_model_ui if (use_reranker and RERANK_AVAILABLE) else None,
+        "reranker_top_n": int(st.session_state.reranker_top_n_ui) if (use_reranker and RERANK_AVAILABLE) else None,
+        "embed_model": CONFIG.embed_model_name,
+    }
+
     report_dir = Path("report")
     plots_dir = report_dir / "plots"
     report_dir.mkdir(exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    df.to_csv(report_dir / "eval_results.csv", index=False, encoding="utf-8")
-    metrics = {
-        "n": n,
-        "top_k": top_k,
-        "recall_at_k": recall,
-        "mrr_at_k": mrr,
-        "avg_precision_at_k": avg_prec,
-    }
-    (report_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # create plots
-    _save_eval_plots(df, plots_dir)
+    try:
+        df.to_csv(report_dir / "eval_results.csv", index=False, encoding="utf-8")
+        (report_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_eval_plots(df, plots_dir)
+    except Exception:
+        pass
 
     return {"ok": True, "metrics": metrics, "df": df, "plots_dir": str(plots_dir)}
 
 
 def dataset_stats_from_cache(cache_path: Path) -> dict:
-    """
-    Returns:
-      - counts by source_type
-      - counts by date
-    """
     if not cache_path.exists():
         return {"ok": False, "error": "local_cache.jsonl not found"}
 
-    types: dict = {}
-    dates: dict = {}
+    types: Dict[str, int] = {}
+    dates: Dict[str, int] = {}
 
     with cache_path.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
+            line = (line or "").strip()
             if not line:
                 continue
-            obj = json.loads(line)
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
             stype = obj.get("source_type", "other")
-            types[stype] = types.get(stype, 0) + 1
+            if stype:
+                types[stype] = types.get(stype, 0) + 1
+
             d = obj.get("date")
             if d:
                 dates[d] = dates.get(d, 0) + 1
@@ -389,42 +580,169 @@ def dataset_stats_from_cache(cache_path: Path) -> dict:
     return {"ok": True, "types": types, "dates": dates}
 
 
-def export_report_zip() -> Optional[Path]:
-    """
-    Creates report/report_package.zip containing:
-      - metrics.json
-      - eval_results.csv
-      - plots/*.png
-    """
-    report_dir = Path("report")
-    if not report_dir.exists():
-        return None
-
-    zip_path = report_dir / "report_package.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in report_dir.rglob("*"):
-            if p.is_dir():
-                continue
-            if p.name.endswith(".zip"):
-                continue
-            z.write(p, arcname=str(p.relative_to(report_dir)))
-    return zip_path
-
-
-# -----------------------------
-# Sidebar
-# -----------------------------
+# ==========================================================
+# Sidebar UI
+# ==========================================================
 st.sidebar.title("⚙️ Налаштування")
 
 st.session_state.online_mode = st.sidebar.toggle(
     "Online mode (дозволити інтернет-запити)",
-    value=st.session_state.online_mode,
+    value=bool(st.session_state.online_mode),
     help="Online = sync та LLM. Offline = тільки локальна база.",
 )
 _online_badge()
 
+
 # -----------------------------
-# VNS (UI only for now)
+# Upload ingest
+# -----------------------------
+with st.sidebar.expander("📄 Upload PDF/DOCX (Local ingest)", expanded=False):
+    uploaded_files = st.file_uploader(
+        "📎 Завантаж PDF/DOCX файли",
+        type=["pdf", "docx"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded_files and st.button("📥 Ingest uploaded files", use_container_width=True):
+        try:
+            import importlib
+            mod = importlib.import_module("core.upload_ingest")
+            ingest_uploaded_files = getattr(mod, "ingest_uploaded_files")
+        except Exception as e:
+            st.error("❌ Не вдалося імпортувати core/upload_ingest.py")
+            st.exception(e)
+        else:
+            with st.spinner("Імпортую файли..."):
+                rep = ingest_uploaded_files(uploaded_files)
+
+            st.success("✅ Файли додано у базу та індекс оновлено.")
+            st.json(rep)
+            _maybe_load_index()
+
+
+
+# -----------------------------
+# Document scope for local uploads
+# -----------------------------
+with st.sidebar.expander("📌 Document scope (local uploads)", expanded=False):
+    doc_options: List[Tuple[str, str]] = []
+
+    try:
+        meta_path = Path(CONFIG.faiss_meta_path)
+        if meta_path.exists():
+            meta_chunks = load_chunks_from_jsonl(meta_path)
+
+            seen = set()
+            for ch in meta_chunks:
+                if (ch.source_type or "").lower() != "local":
+                    continue
+
+                extra = ch.extra or {}
+                doc_id = extra.get("doc_id")
+                if not doc_id:
+                    continue
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+
+                label = extra.get("file_name") or extra.get("saved_as") or doc_id
+                doc_options.append((label, doc_id))
+    except Exception:
+        doc_options = []
+
+    st.session_state.doc_scope_enabled = st.checkbox(
+        "Відповідати тільки по завантаженим файлам",
+        value=bool(st.session_state.doc_scope_enabled),
+    )
+
+    chosen = st.multiselect(
+        "Обрати конкретні файли",
+        options=[x[1] for x in doc_options],
+        format_func=lambda did: next((lbl for lbl, _id in doc_options if _id == did), did),
+        disabled=not st.session_state.doc_scope_enabled,
+    )
+    st.session_state.doc_scope_ids = set(chosen)
+
+
+# -----------------------------
+# Retrieval tuning
+# -----------------------------
+with st.sidebar.expander("🧲 Retrieval tuning (FAISS)", expanded=False):
+    st.session_state.min_score = st.slider(
+        "min_score",
+        0.0,
+        1.0,
+        float(st.session_state.min_score),
+        0.01,
+    )
+    st.session_state.keyword_filter = st.checkbox("keyword_filter", value=bool(st.session_state.keyword_filter))
+    st.session_state.show_retrieval_debug = st.checkbox(
+        "Показати retrieval debug",
+        value=bool(st.session_state.show_retrieval_debug),
+    )
+
+
+# -----------------------------
+# Source filters
+# -----------------------------
+with st.sidebar.expander("🧩 Filters (source types)", expanded=False):
+    st.caption("Фільтрує джерела перед rerank/answer.")
+    st.session_state.filter_lpnu = st.checkbox("LPNU", value=bool(st.session_state.filter_lpnu))
+    st.session_state.filter_tg = st.checkbox("Telegram", value=bool(st.session_state.filter_tg))
+    st.session_state.filter_vns = st.checkbox("VNS", value=bool(st.session_state.filter_vns))
+    st.session_state.filter_local = st.checkbox("Local", value=bool(st.session_state.filter_local))
+
+
+# -----------------------------
+# Answer UI
+# -----------------------------
+with st.sidebar.expander("🧾 Answer UI", expanded=False):
+    st.session_state.show_used_sources_only = st.checkbox(
+        "Показувати тільки джерела, які використала відповідь",
+        value=bool(st.session_state.show_used_sources_only),
+        help="Працює найкраще з LLM, бо є цитати [1],[2]...",
+    )
+    st.session_state.show_chunk_preview = st.checkbox(
+        "Показувати прев’ю chunk’ів",
+        value=bool(st.session_state.show_chunk_preview),
+    )
+
+
+# -----------------------------
+# Reranker
+# -----------------------------
+with st.sidebar.expander("🎯 Reranker (покращення Top-K)", expanded=False):
+    if not RERANK_AVAILABLE:
+        st.warning("Reranker модуль не знайдено (`core/rerank.py`). Функція недоступна.")
+
+    st.session_state.use_reranker_ui = st.checkbox(
+        "Увімкнути Reranker",
+        value=bool(st.session_state.use_reranker_ui),
+        disabled=not RERANK_AVAILABLE,
+        help="Переранжує топ-N кандидатів для кращої точності.",
+    )
+
+    st.session_state.reranker_model_ui = st.text_input(
+        "Reranker model",
+        value=st.session_state.reranker_model_ui,
+        disabled=not (RERANK_AVAILABLE and st.session_state.use_reranker_ui),
+        help="Напр.: cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+
+    st.session_state.reranker_top_n_ui = st.slider(
+        "Reranker candidates (top-N)",
+        min_value=10,
+        max_value=100,
+        value=int(st.session_state.reranker_top_n_ui),
+        step=5,
+        disabled=not (RERANK_AVAILABLE and st.session_state.use_reranker_ui),
+    )
+
+    st.caption("ℹ️ Reranker працює повільніше, але дає помітно кращі топ-результати.")
+
+
+# -----------------------------
+# VNS (UI only)
 # -----------------------------
 with st.sidebar.expander("🔐 ВНС (опційно, без збереження)", expanded=False):
     st.caption(
@@ -438,7 +756,7 @@ with st.sidebar.expander("🔐 ВНС (опційно, без збереженн
     st.write(f"Login: `{st.session_state.vns_login}`")
     st.write(f"Password: `{mask_secret(st.session_state.vns_password)}`")
 
-    if st.button("🧹 Очистити VNS креденшали"):
+    if st.button("🧹 Очистити VNS креденшали", use_container_width=True):
         st.session_state.vns_login = ""
         st.session_state.vns_password = ""
         st.success("Креденшали очищено.")
@@ -576,7 +894,7 @@ with st.sidebar.expander("🤖 LLM інтеграція (опційно)", expan
 
     st.session_state.llm_enabled = st.checkbox(
         "Увімкнути LLM",
-        value=st.session_state.llm_enabled,
+        value=bool(st.session_state.llm_enabled),
         disabled=not st.session_state.online_mode,
         help="Потрібен Online mode.",
     )
@@ -643,13 +961,6 @@ with st.sidebar.expander("🤖 LLM інтеграція (опційно)", expan
         disabled=not st.session_state.online_mode,
     )
 
-    st.caption(
-        "ℹ️ **Temperature впливає на стиль відповіді:**\n"
-        "- **0.0 – 0.3** → сухо, коротко, стабільно\n"
-        "- **0.4 – 0.7** → баланс, природна мова\n"
-        "- **0.8 – 1.0** → довше, творчіше (можливі відхилення)"
-    )
-
     st.session_state.llm_debug = st.checkbox(
         "Показати debug (URL + налаштування без ключа)",
         value=bool(st.session_state.llm_debug),
@@ -659,16 +970,6 @@ with st.sidebar.expander("🤖 LLM інтеграція (опційно)", expan
     if st.session_state.llm_debug:
         base_url = build_base_url(st.session_state.llm_provider, st.session_state.llm_base_url or None)
         st.code(f"Request URL: {base_url}/chat/completions", language="text")
-        st.json(
-            {
-                "enabled": bool(st.session_state.llm_enabled),
-                "provider": st.session_state.llm_provider,
-                "model": st.session_state.llm_model,
-                "temperature": float(st.session_state.llm_temperature),
-                "base_url": st.session_state.llm_base_url or "(auto)",
-                "api_key": "(set)" if st.session_state.llm_api_key else "(empty)",
-            }
-        )
 
     if st.button("🧪 Test LLM", disabled=not (st.session_state.online_mode and st.session_state.llm_enabled)):
         llm = _build_llm_settings()
@@ -686,11 +987,11 @@ with st.sidebar.expander("🤖 LLM інтеграція (опційно)", expan
             st.error(f"LLM test failed: {e}")
 
 
+# ==========================================================
+# Index actions
+# ==========================================================
 st.sidebar.divider()
 
-# -----------------------------
-# Index actions
-# -----------------------------
 if st.sidebar.button("📦 Перевірити/завантажити локальний індекс"):
     try:
         load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
@@ -705,7 +1006,7 @@ if st.sidebar.button("🛠️ Побудувати індекс з local_cache.j
     if not chunks:
         st.sidebar.error(
             "local_cache.jsonl порожній або не існує. "
-            "Натисни 'Sync knowledge base' щоб завантажити LPNU/TG або додай документи локально."
+            "Натисни 'Sync knowledge base' або додай документи локально."
         )
     else:
         try:
@@ -720,9 +1021,10 @@ if st.sidebar.button("🛠️ Побудувати індекс з local_cache.j
         except Exception as e:
             st.sidebar.error(f"Помилка побудови індексу: {e}")
 
-# -----------------------------
+
+# ==========================================================
 # Sync knowledge base
-# -----------------------------
+# ==========================================================
 if st.sidebar.button("🔄 Sync knowledge base (LPNU + TG + rebuild index)", disabled=not st.session_state.online_mode):
     from pipelines.sync_all import sync_all
 
@@ -730,7 +1032,7 @@ if st.sidebar.button("🔄 Sync knowledge base (LPNU + TG + rebuild index)", dis
     api_id = _safe_int(st.session_state.tg_api_id.strip()) if st.session_state.tg_api_id.strip() else None
     api_hash = st.session_state.tg_api_hash.strip() if st.session_state.tg_api_hash.strip() else None
 
-    with st.spinner("Синхронізація знань... (LPNU сторінки можуть зайняти 1–3 хвилини)"):
+    with st.spinner("Синхронізація знань..."):
         report = sync_all(
             api_id=api_id,
             api_hash=api_hash,
@@ -742,11 +1044,11 @@ if st.sidebar.button("🔄 Sync knowledge base (LPNU + TG + rebuild index)", dis
     st.sidebar.json(report)
     _maybe_load_index()
 
-st.sidebar.divider()
 
-# -----------------------------
+# ==========================================================
 # Advanced wipe
-# -----------------------------
+# ==========================================================
+st.sidebar.divider()
 with st.sidebar.expander("🧨 Advanced: wipe local storage", expanded=False):
     st.caption("Видаляє local_cache.jsonl + FAISS index. Корисно для чистих тестів.")
     confirm = st.checkbox("Я розумію що це видалить локальні дані")
@@ -760,15 +1062,19 @@ with st.sidebar.expander("🧨 Advanced: wipe local storage", expanded=False):
         else:
             st.error("❌ Не вдалося видалити всі файли (можуть бути відкриті).")
 
-# -----------------------------
-# Safety / reset
-# -----------------------------
+
+# ==========================================================
+# UI reset
+# ==========================================================
+st.sidebar.divider()
 if st.sidebar.button("🧹 Очистити результати пошуку (UI)"):
     st.session_state.last_results = []
+    st.session_state.last_answer_struct = None
     st.success("Результати очищено.")
 
 if st.sidebar.button("🧨 Повний скидання (очистити UI + креденшали)"):
     st.session_state.last_results = []
+    st.session_state.last_answer_struct = None
     st.session_state.vns_login = ""
     st.session_state.vns_password = ""
     st.session_state.tg_api_id = ""
@@ -784,10 +1090,11 @@ if st.sidebar.button("🧨 Повний скидання (очистити UI + 
     st.success("Сесія очищена (без видалення файлів).")
 
 
-# -----------------------------
+# ==========================================================
 # Main UI
-# -----------------------------
+# ==========================================================
 st.title("🎓 IKNI Assistant — RAG MVP (Streamlit)")
+
 st.caption(
     "MVP: локальний індекс + retrieval + відповідь (offline або через LLM). "
     "Є авто-архів даних (LPNU + Wiki + Telegram) через 'Sync knowledge base'."
@@ -811,15 +1118,15 @@ if st.session_state.last_sync_report:
     with st.expander("📄 Останній Sync report", expanded=False):
         st.json(st.session_state.last_sync_report)
 
-
 tab_chat, tab_eval = st.tabs(["💬 Chat / Search", "📊 Metrics & Evaluation"])
 
 
-# =============================
+# ==========================================================
 # TAB 1: Chat / Search
-# =============================
+# ==========================================================
 with tab_chat:
     st.subheader("⚡ Швидкі запити")
+
     qcol1, qcol2, qcol3, qcol4 = st.columns(4)
     if qcol1.button("Хто директор ІКНІ?"):
         st.session_state.quick_query = "Хто директор ІКНІ?"
@@ -838,9 +1145,10 @@ with tab_chat:
         st.subheader("🔎 Запит")
 
         query = st.text_input("Введи питання", value=default_query)
-        top_k = st.slider("Top-K джерел", min_value=1, max_value=10, value=CONFIG.top_k)
+        top_k = st.slider("Top-K джерел", min_value=1, max_value=10, value=int(CONFIG.top_k))
 
         use_llm = bool(st.session_state.online_mode and st.session_state.llm_enabled)
+
         if use_llm:
             st.caption(
                 f"🤖 Генерація: **LLM ON** • provider=`{st.session_state.llm_provider}` • model=`{st.session_state.llm_model}`"
@@ -848,10 +1156,19 @@ with tab_chat:
         else:
             st.caption("📌 Генерація: **LLM OFF** (offline summarizer)")
 
+        if st.session_state.use_reranker_ui and RERANK_AVAILABLE:
+            st.caption(
+                f"🎯 Reranker: **ON** • model=`{st.session_state.reranker_model_ui}` • topN={st.session_state.reranker_top_n_ui}"
+            )
+        else:
+            st.caption("🎯 Reranker: **OFF**")
+
         ask_btn = st.button("Отримати відповідь", type="primary", use_container_width=True)
 
         if ask_btn:
-            st.session_state.quick_query = ""  # reset
+            st.session_state.quick_query = ""
+            st.session_state.last_query = query
+
             if not query.strip():
                 st.warning("Введи запит.")
             elif not st.session_state.index_ready:
@@ -861,145 +1178,256 @@ with tab_chat:
 
                 index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
 
-                results = search_index(
+                internal_k = max(
+                    getattr(CONFIG, "internal_k_min", 30),
+                    top_k * getattr(CONFIG, "internal_k_multiplier", 8),
+                )
+
+                # raw candidates
+                candidates = search_index(
                     query=query,
                     index=index,
                     chunks=meta,
                     embed_model_name=CONFIG.embed_model_name,
                     top_k=top_k,
+                    internal_k=internal_k,
+                    min_score=float(st.session_state.min_score),
+                    keyword_filter=bool(st.session_state.keyword_filter),
                 )
+
+                # ---------------------------------------
+                # Source type filter
+                # ---------------------------------------
+                allowed_types = set()
+                if st.session_state.filter_lpnu:
+                    allowed_types.add("lpnu")
+                if st.session_state.filter_tg:
+                    allowed_types.add("tg")
+                if st.session_state.filter_vns:
+                    allowed_types.add("vns")
+                if st.session_state.filter_local:
+                    allowed_types.add("local")
+
+                filtered_candidates = [
+                    (ch, sc) for (ch, sc) in candidates
+                    if (ch.source_type or "").lower() in allowed_types
+                ]
+                if not filtered_candidates:
+                    filtered_candidates = candidates
+
+                # ---------------------------------------
+                # Document scope filter (local uploads)
+                # ---------------------------------------
+                if st.session_state.doc_scope_enabled and st.session_state.doc_scope_ids:
+                    scoped = []
+                    allowed_doc_ids = set(st.session_state.doc_scope_ids)
+
+                    for ch, sc in filtered_candidates:
+                        extra = ch.extra or {}
+                        doc_id = extra.get("doc_id")
+                        if doc_id and doc_id in allowed_doc_ids:
+                            scoped.append((ch, sc))
+
+                    if scoped:
+                        filtered_candidates = scoped
+
+                # ---------------------------------------
+                # Rerank (optional)
+                # ---------------------------------------
+                if st.session_state.use_reranker_ui and RERANK_AVAILABLE:
+                    results = rerank_results(
+                        query=query,
+                        results=filtered_candidates[: int(st.session_state.reranker_top_n_ui)],
+                        model_name=st.session_state.reranker_model_ui,
+                        top_k=top_k,
+                    )
+                    ranking_mode = "reranker"
+                else:
+                    results = filtered_candidates[:top_k]
+                    ranking_mode = "faiss"
+
                 st.session_state.last_results = results
 
+                # ---------------------------------------
+                # Answer
+                # ---------------------------------------
                 if use_llm:
                     llm = _build_llm_settings()
-                    answer = make_answer_with_llm(query, results, llm)
+                    ans = make_answer_with_llm_struct(query, results, llm)
                 else:
-                    answer = make_answer_no_llm(query, results)
+                    ans = make_answer_no_llm_struct(query, results)
 
-                st.markdown(answer)
+                st.session_state.last_answer_struct = ans
+
+                st.markdown(ans.markdown, unsafe_allow_html=True)
+
+                if getattr(ans, "warnings", None):
+                    st.warning(" | ".join(ans.warnings))
+
+                st.divider()
+                st.markdown("### 👍👎 Feedback")
+
+                comment = st.text_input("Коментар (опційно)", key="feedback_comment")
+
+                c1, c2, _ = st.columns([1, 1, 3])
+                good = c1.button("👍 Добре", use_container_width=True)
+                bad = c2.button("👎 Погано", use_container_width=True)
+
+                if good or bad:
+                    rating = +1 if good else -1
+                    payload = _feedback_payload(rating=rating, comment=st.session_state.get("feedback_comment", ""))
+                    _append_feedback(payload)
+                    st.success("✅ Дякую! Фідбек збережено.")
+                    st.session_state.feedback_comment = ""
+
+                if st.session_state.show_retrieval_debug:
+                    with st.expander("🧪 Retrieval debug", expanded=False):
+                        st.write(
+                            {
+                                "internal_k_candidates": internal_k,
+                                "candidates_after_search": len(candidates),
+                                "filtered_candidates": len(filtered_candidates),
+                                "top_k_returned": len(results),
+                                "ranking_mode": ranking_mode,
+                                "min_score": float(st.session_state.min_score),
+                                "keyword_filter": bool(st.session_state.keyword_filter),
+                                "allowed_types": sorted(list(allowed_types)),
+                                "doc_scope_enabled": bool(st.session_state.doc_scope_enabled),
+                                "doc_scope_ids": sorted(list(st.session_state.doc_scope_ids or [])),
+                                "used_sources": getattr(ans, "used_sources", []),
+                                "warnings": getattr(ans, "warnings", []),
+                            }
+                        )
 
     with col2:
         st.subheader("📚 Джерела")
+
         if not st.session_state.last_results:
             st.info("Після запиту тут зʼявляться знайдені фрагменти (top-K).")
         else:
+            ans = st.session_state.last_answer_struct
+            used = set(getattr(ans, "used_sources", []) or []) if ans else set()
+
             rows = []
             for rank, (chunk, score) in enumerate(st.session_state.last_results, start=1):
+                if st.session_state.show_used_sources_only and used and (rank not in used):
+                    continue
+
                 rows.append(
                     {
                         "Rank": rank,
-                        "Score": round(score, 4),
+                        "Used": "✅" if (rank in used) else "",
+                        "Score": round(float(score), 4),
                         "Title": chunk.title,
                         "Type": chunk.source_type,
                         "Date": chunk.date,
                         "URL": chunk.url,
+                        "DocID": (chunk.extra or {}).get("doc_id"),
                         "Text (snippet)": (chunk.text[:180] + "…") if len(chunk.text) > 180 else chunk.text,
                     }
                 )
+
             df = pd.DataFrame(rows)
             st.dataframe(df, use_container_width=True, hide_index=True)
 
+            if st.session_state.show_chunk_preview:
+                st.markdown("#### 🔍 Повний текст chunk’ів")
+                for rank, (chunk, score) in enumerate(st.session_state.last_results, start=1):
+                    if st.session_state.show_used_sources_only and used and (rank not in used):
+                        continue
 
-# =============================
+                    label = f"[{rank}] {chunk.title} ({chunk.source_type}) score={score:.3f}"
+                    with st.expander(label, expanded=False):
+                        if chunk.url:
+                            st.write(chunk.url)
+                        if chunk.date:
+                            st.write(chunk.date)
+
+                        extra = chunk.extra or {}
+                        if extra.get("doc_id"):
+                            st.caption(f"doc_id: `{extra.get('doc_id')}`")
+
+                        st.write(chunk.text)
+
+
+# ==========================================================
 # TAB 2: Metrics & Evaluation
-# =============================
+# ==========================================================
 with tab_eval:
     st.subheader("📊 Metrics & Evaluation")
+    st.write("Оцінка retrieval (Recall/MRR/Precision) на eval_set.jsonl + графіки для звіту.")
 
-    st.write(
-        "Тут ти можеш оцінити якість **retrieval** (FAISS + embeddings) "
-        "на тестовому наборі `eval_set.jsonl`, та отримати графіки/метрики для вставки у звіт."
+    eval_k = st.slider("Evaluation K (top-K)", min_value=1, max_value=10, value=5)
+
+    use_reranker_eval = st.checkbox(
+        "Використати Reranker під час evaluation",
+        value=bool(st.session_state.use_reranker_ui and RERANK_AVAILABLE),
+        disabled=not RERANK_AVAILABLE,
     )
 
-    if not st.session_state.index_ready:
-        st.warning("⚠️ Індекс не завантажено. Спершу побудуй/завантаж індекс у сайдбарі.")
-
-    eval_col1, eval_col2 = st.columns([2, 1], gap="large")
-
-    with eval_col1:
-        st.markdown("### ✅ Retrieval evaluation (Recall / MRR / Precision)")
-        eval_k = st.slider("Evaluation K (top-K)", min_value=1, max_value=10, value=5)
-
-        if not Path("eval_set.jsonl").exists():
-            st.error("Файл `eval_set.jsonl` не знайдено. Додай його у корінь проєкту.")
-            st.caption("Формат: JSONL, кожен рядок: {query, must_contain_url | must_contain_type | must_contain_text}.")
+    if st.button("🚀 Run evaluation", type="primary"):
+        if not st.session_state.index_ready:
+            st.error("Спершу завантаж/побудуй індекс.")
+        elif not Path("eval_set.jsonl").exists():
+            st.error("Файл `eval_set.jsonl` не знайдено.")
         else:
-            run_btn = st.button("🚀 Run evaluation", type="primary", use_container_width=True)
+            with st.spinner("Оцінювання retrieval..."):
+                out = run_retrieval_eval(top_k=eval_k, use_reranker=use_reranker_eval)
 
-            if run_btn:
-                if not st.session_state.index_ready:
-                    st.error("Спершу завантаж/побудуй індекс.")
-                else:
-                    with st.spinner("Оцінювання retrieval..."):
-                        out = run_retrieval_eval(top_k=eval_k)
+            if out.get("ok"):
+                st.session_state.last_eval_metrics = out["metrics"]
+                st.session_state.last_eval_df = out["df"]
+                st.session_state.last_eval_plots_dir = out["plots_dir"]
+                st.success("✅ Готово! Результати збережено у `report/`.")
+            else:
+                st.error(out.get("error", "Evaluation failed."))
 
-                    if not out.get("ok"):
-                        st.error(out.get("error"))
-                    else:
-                        st.session_state.last_eval_metrics = out["metrics"]
-                        st.session_state.last_eval_df = out["df"]
-                        st.session_state.last_eval_plots_dir = out["plots_dir"]
-                        st.success("✅ Готово! Результати збережено у `report/` (CSV + JSON + PNG).")
+    if st.session_state.last_eval_metrics:
+        m = st.session_state.last_eval_metrics
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Recall@K", f"{m['recall_at_k']:.3f}")
+        c2.metric("MRR@K", f"{m['mrr_at_k']:.3f}")
+        c3.metric("Avg Precision@K", f"{m['avg_precision_at_k']:.3f}")
+        c4.metric("Mode", str(m.get("mode", "faiss")))
 
-        # show last eval results if exists
-        if st.session_state.last_eval_metrics:
-            m = st.session_state.last_eval_metrics
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Recall@K", f"{m['recall_at_k']:.3f}")
-            c2.metric("MRR@K", f"{m['mrr_at_k']:.3f}")
-            c3.metric("Avg Precision@K", f"{m['avg_precision_at_k']:.3f}")
+        st.caption(
+            f"Embedding model: `{m.get('embed_model')}` | "
+            f"min_score={m.get('min_score')} | keyword_filter={m.get('keyword_filter')}"
+        )
 
-        if isinstance(st.session_state.last_eval_df, pd.DataFrame):
-            st.markdown("### 📋 Evaluation table")
-            st.dataframe(st.session_state.last_eval_df, use_container_width=True, hide_index=True)
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Hit@1", f"{m.get('hit_at_1', 0.0):.3f}")
+        c6.metric("Hit@3", f"{m.get('hit_at_3', 0.0):.3f}")
+        c7.metric("Hit@5", f"{m.get('hit_at_5', 0.0):.3f}")
+        c8.metric("Top1 mean", f"{m.get('top1_score_mean'):.3f}" if m.get("top1_score_mean") is not None else "—")
 
-    with eval_col2:
-        st.markdown("### 📈 Plots")
-        if st.session_state.last_eval_plots_dir:
-            plots_dir = Path(st.session_state.last_eval_plots_dir)
-            p1 = plots_dir / "hit_ratio.png"
-            p2 = plots_dir / "hit_rank_hist.png"
-            p3 = plots_dir / "top1_score_hist.png"
+    if isinstance(st.session_state.last_eval_df, pd.DataFrame):
+        st.markdown("### 📋 Evaluation table")
+        st.dataframe(st.session_state.last_eval_df, use_container_width=True, hide_index=True)
 
-            if p1.exists():
-                st.image(str(p1), caption="Hit ratio (Recall@K visual)")
-            if p2.exists():
-                st.image(str(p2), caption="Hit rank distribution (MRR insight)")
-            if p3.exists():
-                st.image(str(p3), caption="Top-1 similarity score distribution")
-        else:
-            st.info("Запусти evaluation, щоб тут з’явилися графіки.")
+    st.markdown("### 📈 Plots")
+    if st.session_state.last_eval_plots_dir:
+        plots_dir = Path(st.session_state.last_eval_plots_dir)
+        for p in ["hit_ratio.png", "hit_rank_hist.png", "top1_score_hist.png"]:
+            fp = plots_dir / p
+            if fp.exists():
+                st.image(str(fp), caption=p)
 
     st.divider()
-
     st.markdown("### 📦 Dataset statistics (local_cache.jsonl)")
     stats = dataset_stats_from_cache(Path(CONFIG.local_cache_path))
-    if not stats.get("ok"):
-        st.warning(stats.get("error"))
-    else:
-        types = stats["types"]
-        dates = stats["dates"]
-
-        st.write("**Chunks by source_type**")
-        df_types = pd.DataFrame([{"source_type": k, "chunks": v} for k, v in types.items()])
+    if stats.get("ok"):
+        df_types = pd.DataFrame([{"source_type": k, "chunks": v} for k, v in stats["types"].items()])
         st.dataframe(df_types, use_container_width=True, hide_index=True)
         st.bar_chart(df_types.set_index("source_type"))
 
-        if dates:
-            st.write("**Chunks by date**")
-            df_dates = pd.DataFrame([{"date": k, "chunks": v} for k, v in dates.items()]).sort_values("date")
-            st.line_chart(df_dates.set_index("date"))
-
     st.divider()
-
     st.markdown("### 📦 Export for report (ZIP)")
-    st.caption("Формує ZIP з `report/metrics.json`, `report/eval_results.csv`, `report/plots/*.png`.")
     if st.button("📥 Export report package (ZIP)"):
         zp = export_report_zip()
         if not zp:
             st.error("Немає папки report/ або файлів. Спершу запусти evaluation.")
         else:
-            st.success("✅ ZIP сформовано!")
             with open(zp, "rb") as f:
                 st.download_button(
                     label="⬇️ Download report_package.zip",
@@ -1008,9 +1436,30 @@ with tab_eval:
                     mime="application/zip",
                 )
 
+    st.divider()
+    st.markdown("## 🚨 Bad queries panel (Feedback)")
 
+    with st.expander("Bad queries", expanded=False):
+        if not FEEDBACK_PATH.exists():
+            st.info("Ще немає feedback.")
+        else:
+            rows = safe_read_jsonl(FEEDBACK_PATH, limit=5000)
+            if not rows:
+                st.info("Feedback файл є, але не вдалося зчитати JSONL.")
+            else:
+                df_fb = pd.DataFrame(rows)
+                st.dataframe(df_fb, use_container_width=True, hide_index=True)
+
+                if "rating" in df_fb.columns:
+                    bad_df = df_fb[df_fb["rating"] == -1]
+                    st.caption(f"Bad queries: {len(bad_df)}")
+                    st.dataframe(bad_df, use_container_width=True, hide_index=True)
+
+
+# ==========================================================
+# System status
+# ==========================================================
 st.divider()
-
 st.subheader("🧪 Статус системи")
 st.write(
     {
@@ -1023,18 +1472,10 @@ st.write(
         "llm_enabled": bool(st.session_state.llm_enabled),
         "llm_provider": st.session_state.llm_provider,
         "llm_model": st.session_state.llm_model,
+        "reranker_available": bool(RERANK_AVAILABLE),
+        "reranker_enabled": bool(st.session_state.use_reranker_ui and RERANK_AVAILABLE),
+        "doc_scope_enabled": bool(st.session_state.doc_scope_enabled),
+        "doc_scope_ids": sorted(list(st.session_state.doc_scope_ids or [])),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
-)
-
-if Path(CONFIG.local_cache_path).exists():
-    try:
-        total_lines = sum(1 for _ in open(CONFIG.local_cache_path, "r", encoding="utf-8"))
-        st.caption(f"📦 local_cache.jsonl: **{total_lines}** chunks (рядків)")
-    except Exception:
-        pass
-
-st.caption(
-    "Порада: Online mode → Telegram Auth → Sync → тестові запити. "
-    "Оцінювання (Metrics tab) дає метрики + графіки для звіту."
 )

@@ -9,8 +9,12 @@ import requests
 import trafilatura
 from bs4 import BeautifulSoup
 
-from core.ingest_utils import make_chunks_from_doc, existing_chunk_ids, append_jsonl, now_iso_date
-from core.sources import SourceChunk
+from core.ingest_utils import (
+    make_chunks_from_doc,
+    existing_chunk_ids,
+    append_jsonl,
+    now_iso_date,
+)
 
 
 DEFAULT_URLS = [
@@ -32,68 +36,83 @@ DEFAULT_URLS = [
 ]
 
 
-def fetch_url(url: str, timeout: int = 25) -> Optional[str]:
+# -----------------------------
+# HTTP
+# -----------------------------
+def fetch_url(url: str, timeout: int = 25, retries: int = 2, sleep_sec: float = 0.7) -> str:
     headers = {
         "User-Agent": "IKNI-RAG-MVP/1.0 (edu project; contact: student)",
         "Accept-Language": "uk,en;q=0.8",
     }
-    r = requests.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+
+    last_err: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.text or ""
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(sleep_sec)
+
+    raise RuntimeError(f"fetch_url failed after {retries+1} attempts: {last_err}")
 
 
+# -----------------------------
+# Extraction
+# -----------------------------
 def extract_text_trafilatura(html: str, url: str) -> str:
-    downloaded = trafilatura.extract(
-        html,
-        url=url,
-        include_links=False,
-        include_images=False,
-        favor_recall=False,
-    )
-    return downloaded or ""
+    try:
+        downloaded = trafilatura.extract(
+            html,
+            url=url,
+            include_links=False,
+            include_images=False,
+            favor_recall=False,
+        )
+        return (downloaded or "").strip()
+    except Exception:
+        return ""
 
 
 def extract_text_bs4(html: str) -> str:
     """
-    Fallback extractor (simple, but stable).
+    Fallback extractor (simple but stable).
     """
-    soup = BeautifulSoup(html, "lxml")
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
 
-    # remove scripts/styles
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
-    # try main content first
     main = soup.find("main")
     if main:
         text = main.get_text("\n", strip=True)
     else:
         text = soup.get_text("\n", strip=True)
 
-    return text or ""
+    return (text or "").strip()
 
 
-def guess_title(html: str) -> str:
-    m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+def guess_title(html: str, fallback: str = "") -> str:
+    m = re.search(r"<title>(.*?)</title>", html or "", re.IGNORECASE | re.DOTALL)
     if not m:
-        return ""
-    title = m.group(1).strip()
+        return fallback
+    title = (m.group(1) or "").strip()
     title = re.sub(r"\s+", " ", title)
-    return title
+    return title or fallback
 
 
 def clean_extracted_text(text: str) -> str:
-    """
-    Remove common junk patterns from extracted text.
-    """
     if not text:
         return ""
 
-    # Remove repeated menu-ish lines
     lines = [ln.strip() for ln in text.splitlines()]
     lines = [ln for ln in lines if ln and len(ln) >= 2]
 
-    # Drop very noisy lines
     cleaned = []
     for ln in lines:
         if ln.count("|") > 10 or ln.count("+") > 10:
@@ -103,35 +122,31 @@ def clean_extracted_text(text: str) -> str:
         cleaned.append(ln)
 
     text2 = "\n".join(cleaned)
-
-    # Normalize whitespace
     text2 = text2.replace("\xa0", " ")
     text2 = re.sub(r"[ \t]+", " ", text2)
     text2 = re.sub(r"\n{3,}", "\n\n", text2)
     return text2.strip()
 
 
+# -----------------------------
+# Relevance filter (cheap)
+# -----------------------------
 def is_relevant_page(text: str) -> bool:
-    """
-    Very light relevance gate to avoid obvious unrelated garbage.
-    """
-    t = text.lower()
+    t = (text or "").lower()
 
-    # If page is too short after cleaning, skip it
+    # short => skip
     if len(t) < 500:
         return False
 
-    # Filter out unrelated "test" / "art history" etc. (sometimes appears in wiki pages or embedded blocks)
     bad_markers = [
         "предметний тест з історії мистецтва",
         "мовознавства",
         "фольклорних фактів",
-        "жанрів і стилів",  # obviously not about IKNI
+        "жанрів і стилів",
     ]
     if any(b in t for b in bad_markers):
         return False
 
-    # Must contain at least one IKNI/LPN indicators
     good_markers = ["ікні", "львівська політехніка", "інститут", "lpnu", "кафедр"]
     if not any(g in t for g in good_markers):
         return False
@@ -139,52 +154,85 @@ def is_relevant_page(text: str) -> bool:
     return True
 
 
+# -----------------------------
+# Main pipeline
+# -----------------------------
 def ingest_lpnu_pages(
     urls: List[str],
     cache_path,
+    *,
     chunk_size: int = 900,
     overlap: int = 120,
     polite_delay_sec: float = 0.8,
+    fetch_timeout: int = 25,
 ) -> Dict[str, Any]:
+    """
+    Ingest LPNU pages into local_cache.jsonl.
+
+    ✅ stable doc_id per URL: doc_id = f"lpnu::{url}"
+    ✅ safe extraction + filtering
+    ✅ safe dedup by chunk_id
+    """
+    cache_path = str(cache_path)
     existing_ids = existing_chunk_ids(cache_path)
-    added = 0
-    processed = 0
-    skipped = 0
+
+    added_chunks = 0
+    processed_urls = 0
+    skipped_urls = 0
     errors: List[str] = []
+    debug: List[Dict[str, Any]] = []
 
     for url in urls:
-        processed += 1
-        try:
-            html = fetch_url(url)
-            title = guess_title(html) or url
+        processed_urls += 1
+        url = (url or "").strip()
+        if not url:
+            skipped_urls += 1
+            continue
 
-            # Extract
+        try:
+            html = fetch_url(url, timeout=fetch_timeout, retries=2)
+            title = guess_title(html, fallback=url)
+
+            # extract
             text = extract_text_trafilatura(html, url=url)
-            if not text or len(text.strip()) < 200:
+            if not text or len(text) < 200:
                 text = extract_text_bs4(html)
 
-            # Clean
+            # clean
             text = clean_extracted_text(text)
 
-            # Relevance gate
+            # relevance
             if not is_relevant_page(text):
-                skipped += 1
+                skipped_urls += 1
+                debug.append({"url": url, "skipped": True, "reason": "not_relevant_or_too_short"})
                 time.sleep(polite_delay_sec)
                 continue
 
-            chunks: List[SourceChunk] = make_chunks_from_doc(
+            # ✅ stable doc_id per URL
+            doc_id = f"lpnu::{url}"
+
+            extra = {
+                "origin": "lpnu_pages",
+                "doc_id": doc_id,
+                "seed_url": url,
+            }
+
+            chunks = make_chunks_from_doc(
                 source_type="lpnu",
                 url=url,
                 title=title,
                 raw_text=text,
                 date=now_iso_date(),
-                extra={"origin": "lpnu_pages"},
+                extra=extra,
                 chunk_size=chunk_size,
                 overlap=overlap,
+                doc_id=doc_id,  # ✅ force stable doc_id
             )
 
             to_add = []
             for ch in chunks:
+                if not ch.chunk_id:
+                    continue
                 if ch.chunk_id in existing_ids:
                     continue
                 existing_ids.add(ch.chunk_id)
@@ -192,7 +240,9 @@ def ingest_lpnu_pages(
 
             if to_add:
                 append_jsonl(cache_path, to_add)
-                added += len(to_add)
+                added_chunks += len(to_add)
+
+            debug.append({"url": url, "chunks": len(chunks), "added": len(to_add)})
 
         except Exception as e:
             errors.append(f"{url} -> {e}")
@@ -201,8 +251,9 @@ def ingest_lpnu_pages(
 
     return {
         "source": "lpnu",
-        "processed_urls": processed,
-        "added_chunks": added,
-        "skipped_urls": skipped,
+        "processed_urls": processed_urls,
+        "added_chunks": added_chunks,
+        "skipped_urls": skipped_urls,
         "errors": errors,
+        "debug": debug[-30:],  # keep last 30
     }

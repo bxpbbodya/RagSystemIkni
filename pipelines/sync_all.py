@@ -9,6 +9,29 @@ from pipelines.ingest_lpnu import ingest_lpnu_pages, DEFAULT_URLS
 from pipelines.ingest_telegram import ingest_telegram_channel
 from core.index import build_faiss_index, load_chunks_from_jsonl
 
+import time
+
+def rebuild_index() -> Dict[str, Any]:
+    t0 = time.time()
+
+    chunks = load_chunks_from_jsonl(CONFIG.local_cache_path)
+    if not chunks:
+        return {"ok": False, "error": "No chunks in local cache. Run sync first."}
+
+    index, _ = build_faiss_index(
+        chunks=chunks,
+        embed_model_name=CONFIG.embed_model_name,
+        index_path=CONFIG.faiss_index_path,
+        meta_path=CONFIG.faiss_meta_path,
+    )
+
+    return {
+        "ok": True,
+        "chunks_indexed": len(chunks),
+        "time_sec": round(time.time() - t0, 2),
+        "index_size": int(index.ntotal),
+    }
+
 
 def sync_lpnu() -> Dict[str, Any]:
     """

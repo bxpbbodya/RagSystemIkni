@@ -1,28 +1,25 @@
 # Python
 __pycache__/
 *.pyc
-*.log
-
-# venv
+*.pyo
+*.pyd
+*.egg-info/
 .venv/
 venv/
+.env
 
-# IDE
+# Streamlit
+.streamlit/
+
+# Data / caches
+data/
+report/
+*.faiss
+*.jsonl
+*.session
+*.session-journal
+
+# OS / IDE
+.DS_Store
 .idea/
 .vscode/
-
-# Streamlit secrets
-.streamlit/secrets.toml
-
-# Local data / caches
-data/*.session
-data/*.session-journal
-data/local_cache.jsonl
-data/*.faiss
-data/index*.jsonl
-report/
-*.zip
-
-# Env keys
-.env
-.env.*
