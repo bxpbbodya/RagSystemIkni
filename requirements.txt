@@ -15,6 +15,7 @@ requests==2.32.3
 python-dotenv==1.0.1
 
 # Web ingest / scraping
+aiohttp>=3.10.5
 beautifulsoup4==4.12.3
 trafilatura>=1.12.2
 lxml>=5.3.0
@@ -25,6 +26,7 @@ telethon==1.36.0
 
 # Plots
 matplotlib>=3.8
+rouge-score>=0.1.2
 
 # PDF ingest (PyMuPDF -> fitz)
 pymupdf==1.24.9

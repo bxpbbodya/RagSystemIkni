@@ -20,11 +20,7 @@ from core.index import load_faiss_index, build_faiss_index, load_chunks_from_jso
 from core.security import mask_secret
 from core.llm import LLMSettings, chat_completion, build_base_url
 
-# ✅ NEW structured answer API
-from core.rag import (
-    make_answer_no_llm_struct,
-    make_answer_with_llm_struct,
-)
+from core.query_pipeline import answer_query
 
 # Optional reranker
 try:
@@ -198,10 +194,13 @@ def _init_state():
         "min_score": 0.35,
         "keyword_filter": True,
         "show_retrieval_debug": False,
+        "use_structured_extraction": True,
+        "use_institute_filter": True,
+        "use_semantic_rules": True,
 
         # Reranker
         "use_reranker_ui": bool(getattr(CONFIG, "use_reranker", False)) and RERANK_AVAILABLE,
-        "reranker_model_ui": getattr(CONFIG, "reranker_model_name", "cross-encoder/ms-marco-MiniLM-L-6-v2"),
+        "reranker_model_ui": getattr(CONFIG, "reranker_model_name", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"),
         "reranker_top_n_ui": int(getattr(CONFIG, "reranker_top_n", 30)),
 
         # Source filters
@@ -215,8 +214,8 @@ def _init_state():
         "doc_scope_ids": set(),
 
         # Answer UI
-        "show_used_sources_only": False,
-        "show_chunk_preview": True,
+        "show_used_sources_only": True,
+        "show_chunk_preview": False,
 
         # quick query
         "quick_query": "",
@@ -425,18 +424,21 @@ def _save_eval_plots(df: pd.DataFrame, out_dir: Path) -> None:
     plt.savefig(out_dir / "top1_score_hist.png", dpi=200)
     plt.close()
 
-from rouge_score import rouge_scorer
-from sentence_transformers import SentenceTransformer, util
 from pathlib import Path
 import pandas as pd
 import json
 from typing import Optional
 
+try:
+    from rouge_score import rouge_scorer
+except ImportError:
+    rouge_scorer = None
+
 # -----------------------------
 # ROUGE-L
 # -----------------------------
 def rouge_l_score(pred: str, ref: str) -> float:
-    if not pred or not ref:
+    if not pred or not ref or rouge_scorer is None:
         return 0.0
     scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
     scores = scorer.score(ref, pred)
@@ -449,145 +451,65 @@ _embed_cache = {}
 def semantic_similarity_score(pred: str, ref: str, embed_model: str = "all-MiniLM-L6-v2") -> float:
     if not pred or not ref:
         return 0.0
-    if embed_model not in _embed_cache:
-        _embed_cache[embed_model] = SentenceTransformer(embed_model)
-    model = _embed_cache[embed_model]
-    embeddings = model.encode([pred, ref], convert_to_tensor=True)
-    sim = util.pytorch_cos_sim(embeddings[0], embeddings[1])
-    return float(sim)
+    try:
+        from sentence_transformers import SentenceTransformer, util
+    except Exception:
+        return 0.0
+    try:
+        if embed_model not in _embed_cache:
+            try:
+                _embed_cache[embed_model] = SentenceTransformer(embed_model, local_files_only=True)
+            except Exception:
+                _embed_cache[embed_model] = SentenceTransformer(embed_model)
+        model = _embed_cache[embed_model]
+        embeddings = model.encode([pred, ref], convert_to_tensor=True)
+        sim = util.pytorch_cos_sim(embeddings[0], embeddings[1])
+        return float(sim)
+    except Exception:
+        return 0.0
 
 # -----------------------------
 # Run retrieval evaluation
 # -----------------------------
-def run_retrieval_eval(top_k: int = 5, use_reranker: bool = False) -> dict:
-    from core.index import search_index
+def run_retrieval_eval(top_k: int = 5, use_reranker: bool = False, use_institute_filter: bool = True) -> dict:
+    from core.evaluation import PipelineConfig, load_eval_set, run_pipeline_evaluation
 
     eval_path = Path("eval_set.jsonl")
-    eval_set = _load_eval_set(eval_path)
+    eval_set = load_eval_set(eval_path)
     if not eval_set:
         return {"ok": False, "error": "eval_set.jsonl not found or empty."}
 
     index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
-
-    hits = hits_at_1 = hits_at_3 = hits_at_5 = 0
-    rr_sum = 0.0
-    rows = []
-
-    internal_k = max(getattr(CONFIG, "internal_k_min", 30), top_k * getattr(CONFIG, "internal_k_multiplier", 8))
-    rerank_top_n = int(st.session_state.reranker_top_n_ui)
-
-    for ex in eval_set:
-        query = ex.get("query", "")
-        candidates = search_index(
-            query=query,
-            index=index,
-            chunks=meta,
-            embed_model_name=CONFIG.embed_model_name,
-            top_k=top_k,
-            internal_k=internal_k,
-            min_score=float(st.session_state.min_score),
-            keyword_filter=bool(st.session_state.keyword_filter),
-        )
-
-        if use_reranker and RERANK_AVAILABLE:
-            results = rerank_results(
-                query=query,
-                results=candidates[:rerank_top_n],
-                model_name=st.session_state.reranker_model_ui,
-                top_k=top_k,
-            )
-            mode = "reranker"
-        else:
-            results = candidates[:top_k]
-            mode = "faiss"
-
-        hit_rank: Optional[int] = None
-        rel_count = 0
-
-        for i, (chunk, score) in enumerate(results, start=1):
-            is_hit = _is_hit(chunk, ex)
-            if not is_hit and i <= 3 and results:
-                is_hit = True if score > 0.3 else False
-            if is_hit:
-                rel_count += 1
-                if hit_rank is None:
-                    hit_rank = i
-
-        hit = hit_rank is not None
-        if hit:
-            hits += 1
-            rr_sum += 1.0 / float(hit_rank) * (1.0 + 0.05)
-            if hit_rank <= 1:
-                hits_at_1 += 1
-            if hit_rank <= 3:
-                hits_at_3 += 1
-            if hit_rank <= 5:
-                hits_at_5 += 1
-
-        precision = rel_count / float(top_k) if top_k else 0.0
-        precision *= 1.05
-
-        # -----------------------------
-        # Метрики тексту
-        # -----------------------------
-        if results:
-            top1_text = results[0][0].text or ""
-            # Якщо є answer в eval_set, беремо його, інакше - сам топ1 chunk
-            ex_answer = ex.get("answer", top1_text)
-            rouge_l = rouge_l_score(top1_text, ex_answer)
-            semantic_sim = semantic_similarity_score(top1_text, ex_answer, embed_model=CONFIG.embed_model_name)
-            # легкий boost, щоб було красиво в таблиці
-            if rouge_l is not None:
-                rouge_l = min(rouge_l + 0.02, 1.0)
-            if semantic_sim is not None:
-                semantic_sim = min(semantic_sim + 0.02, 1.0)
-        else:
-            rouge_l, semantic_sim = None, None
-
-        rows.append({
-            "query": query,
-            "hit": hit,
-            "hit_rank": hit_rank,
-            "precision@k": round(precision, 4),
-            "top1_score": float(results[0][1]) if results else None,
-            "top1_url": results[0][0].url if results else None,
-            "top1_type": results[0][0].source_type if results else None,
-            "mode": mode,
-            "rouge_l": rouge_l,
-            "semantic_sim": semantic_sim,
-        })
-
-    # -----------------------------
-    # агреговані метрики
-    # -----------------------------
-    n = len(eval_set)
-    recall = hits / n if n else 0.0
-    mrr = rr_sum / n if n else 0.0
-    avg_prec = sum(r["precision@k"] for r in rows) / n if n else 0.0
-
-    df = pd.DataFrame(rows)
-    top1_scores = df["top1_score"].dropna()
-    mean_top1 = float(top1_scores.mean()) if not top1_scores.empty else None
-    median_top1 = float(top1_scores.median()) if not top1_scores.empty else None
-
-    metrics = {
-        "n": n,
-        "top_k": top_k,
-        "mode": mode,
-        "recall_at_k": recall,
-        "mrr_at_k": mrr,
-        "avg_precision_at_k": avg_prec,
-        "hit_at_1": hits_at_1 / n if n else 0.0,
-        "hit_at_3": hits_at_3 / n if n else 0.0,
-        "hit_at_5": hits_at_5 / n if n else 0.0,
-        "top1_score_mean": mean_top1,
-        "top1_score_median": median_top1,
-        "min_score": float(st.session_state.min_score),
-        "keyword_filter": bool(st.session_state.keyword_filter),
-        "reranker_model": st.session_state.reranker_model_ui if (use_reranker and RERANK_AVAILABLE) else None,
-        "reranker_top_n": int(st.session_state.reranker_top_n_ui) if (use_reranker and RERANK_AVAILABLE) else None,
-        "embed_model": CONFIG.embed_model_name,
-    }
+    config = PipelineConfig(
+        name="app_eval_pipeline",
+        embed_model=CONFIG.embed_model_name,
+        top_k=top_k,
+        use_hybrid=True,
+        use_reranker=bool(use_reranker and RERANK_AVAILABLE),
+        reranker_model=st.session_state.reranker_model_ui if (use_reranker and RERANK_AVAILABLE) else None,
+        reranker_top_n=int(st.session_state.reranker_top_n_ui),
+        use_query_expansion=True,
+        use_adaptive_top_k=True,
+        use_generation=False,
+        use_extraction=bool(st.session_state.use_structured_extraction),
+        use_institute_filter=bool(use_institute_filter),
+        use_rules=bool(st.session_state.use_semantic_rules),
+        keyword_filter=bool(st.session_state.keyword_filter),
+        min_score=float(st.session_state.min_score),
+    )
+    metrics, df = run_pipeline_evaluation(
+        eval_set=eval_set,
+        index=index,
+        chunks=meta,
+        config=config,
+        llm=None,
+    )
+    metrics["mode"] = "adaptive_hybrid_reranker" if (use_reranker and RERANK_AVAILABLE) else "adaptive_hybrid"
+    metrics["min_score"] = float(st.session_state.min_score)
+    metrics["keyword_filter"] = bool(st.session_state.keyword_filter)
+    metrics["use_institute_filter"] = bool(use_institute_filter)
+    metrics["reranker_model"] = st.session_state.reranker_model_ui if (use_reranker and RERANK_AVAILABLE) else None
+    metrics["reranker_top_n"] = int(st.session_state.reranker_top_n_ui) if (use_reranker and RERANK_AVAILABLE) else None
 
     report_dir = Path("report")
     plots_dir = report_dir / "plots"
@@ -596,12 +518,25 @@ def run_retrieval_eval(top_k: int = 5, use_reranker: bool = False) -> dict:
 
     try:
         df.to_csv(report_dir / "eval_results.csv", index=False, encoding="utf-8")
-        (report_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        (report_dir / "metrics.json").write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        errors = list(getattr(df, "attrs", {}).get("errors", []) or [])
+        (report_dir / "eval_errors.jsonl").write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in errors),
+            encoding="utf-8",
+        )
         _save_eval_plots(df, plots_dir)
     except Exception:
         pass
 
-    return {"ok": True, "metrics": metrics, "df": df, "plots_dir": str(plots_dir)}
+    return {
+        "ok": True,
+        "metrics": metrics,
+        "df": df,
+        "plots_dir": str(plots_dir)
+    }
 
 def dataset_stats_from_cache(cache_path: Path) -> dict:
     if not cache_path.exists():
@@ -632,782 +567,882 @@ def dataset_stats_from_cache(cache_path: Path) -> dict:
 
 
 # ==========================================================
-# Sidebar UI
+# Mode switch (VERY IMPORTANT)
 # ==========================================================
-st.sidebar.title("⚙️ Налаштування")
-
-st.session_state.online_mode = st.sidebar.toggle(
-    "Online mode (дозволити інтернет-запити)",
-    value=bool(st.session_state.online_mode),
-    help="Online = sync та LLM. Offline = тільки локальна база.",
+mode = st.sidebar.radio(
+    "Режим",
+    ["LIGHT", "PRO"],
+    index=0
 )
-_online_badge()
+if mode == "PRO":
+    # ==========================================================
+    # Sidebar UI
+    # ==========================================================
+    st.sidebar.title("⚙️ Налаштування")
 
-
-# -----------------------------
-# Upload ingest
-# -----------------------------
-with st.sidebar.expander("📄 Upload PDF/DOCX (Local ingest)", expanded=False):
-    uploaded_files = st.file_uploader(
-        "📎 Завантаж PDF/DOCX файли",
-        type=["pdf", "docx"],
-        accept_multiple_files=True,
+    st.session_state.online_mode = st.sidebar.toggle(
+        "Online mode (дозволити інтернет-запити)",
+        value=bool(st.session_state.online_mode),
+        help="Online = sync та LLM. Offline = тільки локальна база.",
     )
+    _online_badge()
 
-    if uploaded_files and st.button("📥 Ingest uploaded files", use_container_width=True):
+    # -----------------------------
+    # Upload ingest
+    # -----------------------------
+    with st.sidebar.expander("📄 Upload PDF/DOCX (Local ingest)", expanded=False):
+        uploaded_files = st.file_uploader(
+            "📎 Завантаж PDF/DOCX файли",
+            type=["pdf", "docx"],
+            accept_multiple_files=True,
+        )
+
+        if uploaded_files and st.button("📥 Ingest uploaded files", use_container_width=True):
+            try:
+                import importlib
+
+                mod = importlib.import_module("core.upload_ingest")
+                ingest_uploaded_files = getattr(mod, "ingest_uploaded_files")
+            except Exception as e:
+                st.error("❌ Не вдалося імпортувати core/upload_ingest.py")
+                st.exception(e)
+            else:
+                with st.spinner("Імпортую файли..."):
+                    rep = ingest_uploaded_files(uploaded_files)
+
+                st.success("✅ Файли додано у базу та індекс оновлено.")
+                st.json(rep)
+                _maybe_load_index()
+
+    # -----------------------------
+    # Document scope for local uploads
+    # -----------------------------
+    with st.sidebar.expander("📌 Document scope (local uploads)", expanded=False):
+        doc_options: List[Tuple[str, str]] = []
+
         try:
-            import importlib
-            mod = importlib.import_module("core.upload_ingest")
-            ingest_uploaded_files = getattr(mod, "ingest_uploaded_files")
-        except Exception as e:
-            st.error("❌ Не вдалося імпортувати core/upload_ingest.py")
-            st.exception(e)
+            meta_path = Path(CONFIG.faiss_meta_path)
+            if meta_path.exists():
+                meta_chunks = load_chunks_from_jsonl(meta_path)
+
+                seen = set()
+                for ch in meta_chunks:
+                    if (ch.source_type or "").lower() != "local":
+                        continue
+
+                    extra = ch.extra or {}
+                    doc_id = extra.get("doc_id")
+                    if not doc_id:
+                        continue
+                    if doc_id in seen:
+                        continue
+                    seen.add(doc_id)
+
+                    label = extra.get("file_name") or extra.get("saved_as") or doc_id
+                    doc_options.append((label, doc_id))
+        except Exception:
+            doc_options = []
+
+        st.session_state.doc_scope_enabled = st.checkbox(
+            "Відповідати тільки по завантаженим файлам",
+            value=bool(st.session_state.doc_scope_enabled),
+        )
+
+        chosen = st.multiselect(
+            "Обрати конкретні файли",
+            options=[x[1] for x in doc_options],
+            format_func=lambda did: next((lbl for lbl, _id in doc_options if _id == did), did),
+            disabled=not st.session_state.doc_scope_enabled,
+        )
+        st.session_state.doc_scope_ids = set(chosen)
+
+    # -----------------------------
+    # Retrieval tuning
+    # -----------------------------
+    with st.sidebar.expander("🧲 Retrieval tuning (FAISS)", expanded=False):
+        st.session_state.min_score = st.slider(
+            "min_score",
+            0.0,
+            1.0,
+            float(st.session_state.min_score),
+            0.01,
+        )
+        st.session_state.keyword_filter = st.checkbox("keyword_filter", value=bool(st.session_state.keyword_filter))
+        st.session_state.use_structured_extraction = st.checkbox(
+            "Structured extraction (entity-level)",
+            value=bool(st.session_state.use_structured_extraction),
+            help="ON: парсинг сутностей та ролей. OFF: fallback на LLM/summary.",
+        )
+        st.session_state.use_institute_filter = st.checkbox(
+            "Institute-aware filtering",
+            value=bool(st.session_state.use_institute_filter),
+            help="Фільтрує chunks по інституту з запиту до ранжування.",
+        )
+        st.session_state.use_semantic_rules = st.checkbox(
+            "Semantic intent rules",
+            value=bool(st.session_state.use_semantic_rules),
+            help="Жорсткі правила для rector/director та рівня сутностей.",
+        )
+        st.session_state.show_retrieval_debug = st.checkbox(
+            "Показати retrieval debug",
+            value=bool(st.session_state.show_retrieval_debug),
+        )
+
+    # -----------------------------
+    # Source filters
+    # -----------------------------
+    with st.sidebar.expander("🧩 Filters (source types)", expanded=False):
+        st.caption("Фільтрує джерела перед rerank/answer.")
+        st.session_state.filter_lpnu = st.checkbox("LPNU", value=bool(st.session_state.filter_lpnu))
+        st.session_state.filter_tg = st.checkbox("Telegram", value=bool(st.session_state.filter_tg))
+        st.session_state.filter_vns = st.checkbox("VNS", value=bool(st.session_state.filter_vns))
+        st.session_state.filter_local = st.checkbox("Local", value=bool(st.session_state.filter_local))
+
+    # -----------------------------
+    # Answer UI
+    # -----------------------------
+    with st.sidebar.expander("🧾 Answer UI", expanded=False):
+        st.session_state.show_used_sources_only = st.checkbox(
+            "Показувати тільки джерела, які використала відповідь",
+            value=bool(st.session_state.show_used_sources_only),
+            help="Працює найкраще з LLM, бо є цитати [1],[2]...",
+        )
+        st.session_state.show_chunk_preview = st.checkbox(
+            "Показувати прев’ю chunk’ів",
+            value=bool(st.session_state.show_chunk_preview),
+        )
+
+    # -----------------------------
+    # Reranker
+    # -----------------------------
+    with st.sidebar.expander("🎯 Reranker (покращення Top-K)", expanded=False):
+        if not RERANK_AVAILABLE:
+            st.warning("Reranker модуль не знайдено (`core/rerank.py`). Функція недоступна.")
+
+        st.session_state.use_reranker_ui = st.checkbox(
+            "Увімкнути Reranker",
+            value=bool(st.session_state.use_reranker_ui),
+            disabled=not RERANK_AVAILABLE,
+            help="Переранжує топ-N кандидатів для кращої точності.",
+        )
+
+        st.session_state.reranker_model_ui = st.text_input(
+            "Reranker model",
+            value=st.session_state.reranker_model_ui,
+            disabled=not (RERANK_AVAILABLE and st.session_state.use_reranker_ui),
+            help="Напр.: cross-encoder/ms-marco-MiniLM-L-6-v2",
+        )
+
+        st.session_state.reranker_top_n_ui = st.slider(
+            "Reranker candidates (top-N)",
+            min_value=10,
+            max_value=100,
+            value=int(st.session_state.reranker_top_n_ui),
+            step=5,
+            disabled=not (RERANK_AVAILABLE and st.session_state.use_reranker_ui),
+        )
+
+        st.caption("ℹ️ Reranker працює повільніше, але дає помітно кращі топ-результати.")
+
+    # -----------------------------
+    # VNS (UI only)
+    # -----------------------------
+    with st.sidebar.expander("🔐 ВНС (опційно, без збереження)", expanded=False):
+        st.caption(
+            "Логін і пароль зберігаються тільки в оперативній памʼяті (session_state). "
+            "Не записуються у файли."
+        )
+        st.session_state.vns_login = st.text_input("VNS login", value=st.session_state.vns_login)
+        st.session_state.vns_password = st.text_input("VNS password", value=st.session_state.vns_password,
+                                                      type="password")
+
+        st.write("**Зараз збережено в сесії:**")
+        st.write(f"Login: `{st.session_state.vns_login}`")
+        st.write(f"Password: `{mask_secret(st.session_state.vns_password)}`")
+
+        if st.button("🧹 Очистити VNS креденшали", use_container_width=True):
+            st.session_state.vns_login = ""
+            st.session_state.vns_password = ""
+            st.success("Креденшали очищено.")
+
+    # -----------------------------
+    # Telegram (Auth + Test)
+    # -----------------------------
+    with st.sidebar.expander("📡 Telegram інтеграція (Auth + Sync)", expanded=False):
+        st.caption(
+            "Telethon потребує **один раз** авторизувати сесію. "
+            "Після цього ingest/sync працює без телефону та коду.\n\n"
+            "Сесія зберігається локально у файлі: `data/tg_session.session` (не комітити в Git)."
+        )
+
+        st.session_state.tg_api_id = st.text_input("Telegram API ID", value=st.session_state.tg_api_id)
+        st.session_state.tg_api_hash = st.text_input("Telegram API HASH", value=st.session_state.tg_api_hash,
+                                                     type="password")
+        st.session_state.tg_channels = st.text_area("Telegram channels (one per line)",
+                                                    value=st.session_state.tg_channels)
+
+        api_id_int = _safe_int(st.session_state.tg_api_id.strip()) if st.session_state.tg_api_id.strip() else None
+        api_hash_str = st.session_state.tg_api_hash.strip() if st.session_state.tg_api_hash.strip() else None
+
+        st.divider()
+        st.subheader("🔐 Telegram авторизація (1 раз)")
+
+        st.session_state.tg_phone = st.text_input("Телефон (+380...)", value=st.session_state.tg_phone)
+        st.session_state.tg_code = st.text_input("Код з Telegram", value=st.session_state.tg_code)
+        st.session_state.tg_2fa = st.text_input("2FA пароль (якщо увімкнено)", value=st.session_state.tg_2fa,
+                                                type="password")
+
+        colA, colB = st.columns(2)
+        send_code_btn = colA.button("📨 Надіслати код", disabled=not st.session_state.online_mode)
+        sign_in_btn = colB.button("✅ Підтвердити код", disabled=not st.session_state.online_mode)
+
+        if send_code_btn:
+            if not api_id_int or not api_hash_str or not st.session_state.tg_phone.strip():
+                st.error("Вкажи api_id, api_hash і номер телефону.")
+            else:
+                try:
+                    from telethon import TelegramClient
+
+
+                    async def _send_code():
+                        async with TelegramClient("data/tg_session", api_id_int, api_hash_str) as client:
+                            await client.send_code_request(st.session_state.tg_phone.strip())
+                            return True
+
+
+                    with st.spinner("Надсилаю код..."):
+                        _run_async(_send_code(), timeout_sec=25)
+                    st.success("✅ Код надіслано. Введи код та натисни 'Підтвердити код'.")
+                except Exception as e:
+                    st.error(f"❌ Не вдалося надіслати код: {e}")
+
+        if sign_in_btn:
+            if not api_id_int or not api_hash_str or not st.session_state.tg_phone.strip() or not st.session_state.tg_code.strip():
+                st.error("Вкажи api_id, api_hash, телефон і код.")
+            else:
+                try:
+                    from telethon import TelegramClient
+                    from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+
+
+                    async def _sign_in():
+                        async with TelegramClient("data/tg_session", api_id_int, api_hash_str) as client:
+                            try:
+                                await client.sign_in(phone=st.session_state.tg_phone.strip(),
+                                                     code=st.session_state.tg_code.strip())
+                                return {"ok": True, "msg": "✅ Авторизація успішна! Сесія збережена."}
+                            except SessionPasswordNeededError:
+                                if not st.session_state.tg_2fa.strip():
+                                    return {"ok": False, "msg": "⚠️ Увімкнено 2FA. Введи пароль і повтори."}
+                                await client.sign_in(password=st.session_state.tg_2fa.strip())
+                                return {"ok": True, "msg": "✅ Авторизація успішна (2FA). Сесія збережена."}
+                            except PhoneCodeInvalidError:
+                                return {"ok": False, "msg": "❌ Невірний код."}
+
+
+                    with st.spinner("Авторизація..."):
+                        out = _run_async(_sign_in(), timeout_sec=35)
+                    if out["ok"]:
+                        st.success(out["msg"])
+                    else:
+                        st.warning(out["msg"])
+                except Exception as e:
+                    st.error(f"❌ Авторизація не вдалася: {e}")
+
+        st.divider()
+        st.subheader("🧪 Test Telegram (last 3 msgs)")
+
+        test_btn = st.button("🧪 Test Telegram (show last 3 msgs)", disabled=not st.session_state.online_mode)
+
+        if test_btn:
+            channels = _parse_tg_channels(st.session_state.tg_channels)
+            if not api_id_int or not api_hash_str or not channels:
+                st.error("Введи api_id, api_hash і хоча б 1 канал (наприклад pbikni).")
+            else:
+                try:
+                    from telethon import TelegramClient
+
+
+                    async def _test_channel():
+                        ch = _normalize_channel(channels[0])
+                        async with TelegramClient("data/tg_session", api_id_int, api_hash_str) as client:
+                            is_auth = await client.is_user_authorized()
+                            if not is_auth:
+                                return {"ok": False, "err": "❌ Сесія НЕ авторизована. Спочатку зроби авторизацію вище."}
+
+                            entity = await client.get_entity(ch)
+                            msgs = []
+                            async for m in client.iter_messages(entity, limit=3):
+                                txt = (getattr(m, "message", None) or "").strip()
+                                if not txt:
+                                    continue
+                                msgs.append((m.id, m.date, txt))
+                            return {"ok": True, "channel": ch, "msgs": msgs}
+
+
+                    with st.spinner("Тестую Telegram (до 25 сек)..."):
+                        out = _run_async(_test_channel(), timeout_sec=25)
+
+                    if not out["ok"]:
+                        st.error(out["err"])
+                    else:
+                        st.success(f"✅ Канал доступний: {out['channel']}")
+                        if not out["msgs"]:
+                            st.info("Немає текстових повідомлень у останніх 3 або вони порожні.")
+                        for mid, dt, txt in out["msgs"]:
+                            st.write(f"**{mid}** • {dt}  \n{txt}")
+
+                except Exception as e:
+                    st.error(f"Telegram test failed: {e}")
+
+    # -----------------------------
+    # LLM settings
+    # -----------------------------
+    with st.sidebar.expander("🤖 LLM інтеграція (опційно)", expanded=False):
+        st.caption(
+            "RAG + LLM генерація. Працює через OpenAI-compatible API: OpenAI / Groq / OpenRouter / Ollama / Custom.\n"
+            "🔒 Ключ зберігається лише в session_state."
+        )
+
+        st.session_state.llm_enabled = st.checkbox(
+            "Увімкнути LLM",
+            value=bool(st.session_state.llm_enabled),
+            disabled=not st.session_state.online_mode,
+            help="Потрібен Online mode.",
+        )
+
+        provider = st.selectbox(
+            "Провайдер",
+            options=PROVIDERS,
+            index=PROVIDERS.index(st.session_state.llm_provider),
+            disabled=not st.session_state.online_mode,
+        )
+
+        if provider != st.session_state.llm_provider:
+            st.session_state.llm_provider = provider
+            st.session_state.llm_model = _provider_default_model(provider)
+
+        _ensure_valid_model_for_provider(st.session_state.llm_provider)
+
+        preset_models = MODEL_PRESETS.get(st.session_state.llm_provider, [])
+        st.session_state.use_custom_model = st.checkbox(
+            "Вказати модель вручну",
+            value=bool(st.session_state.use_custom_model),
+            disabled=not st.session_state.online_mode,
+        )
+
+        if (not st.session_state.use_custom_model) and preset_models:
+            options = preset_models[:]
+            if st.session_state.llm_model and st.session_state.llm_model not in options:
+                options = [st.session_state.llm_model] + options
+
+            selected_model = st.selectbox(
+                "Модель (вибери зі списку)",
+                options=options,
+                index=options.index(st.session_state.llm_model) if st.session_state.llm_model in options else 0,
+                disabled=not st.session_state.online_mode,
+            )
+            st.session_state.llm_model = selected_model
         else:
-            with st.spinner("Імпортую файли..."):
-                rep = ingest_uploaded_files(uploaded_files)
+            st.session_state.llm_model = st.text_input(
+                "Модель (вручну)",
+                value=st.session_state.llm_model,
+                disabled=not st.session_state.online_mode,
+            )
 
-            st.success("✅ Файли додано у базу та індекс оновлено.")
-            st.json(rep)
-            _maybe_load_index()
+        st.session_state.llm_api_key = st.text_input(
+            "API Key",
+            value=st.session_state.llm_api_key,
+            type="password",
+            disabled=(not st.session_state.online_mode) or (st.session_state.llm_provider == "ollama"),
+        )
 
+        st.session_state.llm_base_url = st.text_input(
+            "Custom Base URL (тільки для custom)",
+            value=st.session_state.llm_base_url,
+            disabled=(not st.session_state.online_mode) or (st.session_state.llm_provider != "custom"),
+            help="Напр.: https://your-openai-compatible-endpoint/v1",
+        )
 
+        st.session_state.llm_temperature = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.llm_temperature),
+            step=0.05,
+            disabled=not st.session_state.online_mode,
+        )
 
-# -----------------------------
-# Document scope for local uploads
-# -----------------------------
-with st.sidebar.expander("📌 Document scope (local uploads)", expanded=False):
-    doc_options: List[Tuple[str, str]] = []
+        st.session_state.llm_debug = st.checkbox(
+            "Показати debug (URL + налаштування без ключа)",
+            value=bool(st.session_state.llm_debug),
+            disabled=not st.session_state.online_mode,
+        )
 
-    try:
-        meta_path = Path(CONFIG.faiss_meta_path)
-        if meta_path.exists():
-            meta_chunks = load_chunks_from_jsonl(meta_path)
+        if st.session_state.llm_debug:
+            base_url = build_base_url(st.session_state.llm_provider, st.session_state.llm_base_url or None)
+            st.code(f"Request URL: {base_url}/chat/completions", language="text")
 
-            seen = set()
-            for ch in meta_chunks:
-                if (ch.source_type or "").lower() != "local":
-                    continue
+        if st.button("🧪 Test LLM", disabled=not (st.session_state.online_mode and st.session_state.llm_enabled)):
+            llm = _build_llm_settings()
+            try:
+                test_out = chat_completion(
+                    llm,
+                    messages=[
+                        {"role": "system", "content": "Ти тестовий помічник."},
+                        {"role": "user", "content": "Напиши 'OK' і поточну дату у форматі YYYY-MM-DD."},
+                    ],
+                )
+                st.success("✅ LLM працює!")
+                st.write(test_out)
+            except Exception as e:
+                st.error(f"LLM test failed: {e}")
 
-                extra = ch.extra or {}
-                doc_id = extra.get("doc_id")
-                if not doc_id:
-                    continue
-                if doc_id in seen:
-                    continue
-                seen.add(doc_id)
+    # ==========================================================
+    # Index actions
+    # ==========================================================
+    st.sidebar.divider()
 
-                label = extra.get("file_name") or extra.get("saved_as") or doc_id
-                doc_options.append((label, doc_id))
-    except Exception:
-        doc_options = []
+    if st.sidebar.button("📦 Перевірити/завантажити локальний індекс"):
+        try:
+            load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
+            st.session_state.index_ready = True
+            st.sidebar.success("FAISS індекс завантажено ✅")
+        except Exception as e:
+            st.session_state.index_ready = False
+            st.sidebar.error(f"Не знайдено індекс: {e}")
 
-    st.session_state.doc_scope_enabled = st.checkbox(
-        "Відповідати тільки по завантаженим файлам",
-        value=bool(st.session_state.doc_scope_enabled),
-    )
+    if st.sidebar.button("🛠️ Побудувати індекс з local_cache.jsonl"):
+        chunks = load_chunks_from_jsonl(CONFIG.local_cache_path)
+        if not chunks:
+            st.sidebar.error(
+                "local_cache.jsonl порожній або не існує. "
+                "Натисни 'Sync knowledge base' або додай документи локально."
+            )
+        else:
+            try:
+                build_faiss_index(
+                    chunks=chunks,
+                    embed_model_name=CONFIG.embed_model_name,
+                    index_path=CONFIG.faiss_index_path,
+                    meta_path=CONFIG.faiss_meta_path,
+                )
+                st.session_state.index_ready = True
+                st.sidebar.success("Індекс успішно побудовано ✅")
+            except Exception as e:
+                st.sidebar.error(f"Помилка побудови індексу: {e}")
 
-    chosen = st.multiselect(
-        "Обрати конкретні файли",
-        options=[x[1] for x in doc_options],
-        format_func=lambda did: next((lbl for lbl, _id in doc_options if _id == did), did),
-        disabled=not st.session_state.doc_scope_enabled,
-    )
-    st.session_state.doc_scope_ids = set(chosen)
+    # ==========================================================
+    # Sync knowledge base
+    # ==========================================================
+    if st.sidebar.button("🔄 Sync knowledge base (LPNU + TG + rebuild index)",
+                         disabled=not st.session_state.online_mode):
+        from pipelines.sync_all import sync_all
 
+        channels = _parse_tg_channels(st.session_state.tg_channels)
+        api_id = _safe_int(st.session_state.tg_api_id.strip()) if st.session_state.tg_api_id.strip() else None
+        api_hash = st.session_state.tg_api_hash.strip() if st.session_state.tg_api_hash.strip() else None
 
-# -----------------------------
-# Retrieval tuning
-# -----------------------------
-with st.sidebar.expander("🧲 Retrieval tuning (FAISS)", expanded=False):
-    st.session_state.min_score = st.slider(
-        "min_score",
-        0.0,
-        1.0,
-        float(st.session_state.min_score),
-        0.01,
-    )
-    st.session_state.keyword_filter = st.checkbox("keyword_filter", value=bool(st.session_state.keyword_filter))
-    st.session_state.show_retrieval_debug = st.checkbox(
-        "Показати retrieval debug",
-        value=bool(st.session_state.show_retrieval_debug),
-    )
+        with st.spinner("Синхронізація знань..."):
+            report = sync_all(
+                api_id=api_id,
+                api_hash=api_hash,
+                channels=channels if (api_id and api_hash and channels) else None,
+            )
 
+        st.session_state.last_sync_report = report
+        st.sidebar.success("Sync завершено ✅")
+        st.sidebar.json(report)
+        _maybe_load_index()
 
-# -----------------------------
-# Source filters
-# -----------------------------
-with st.sidebar.expander("🧩 Filters (source types)", expanded=False):
-    st.caption("Фільтрує джерела перед rerank/answer.")
-    st.session_state.filter_lpnu = st.checkbox("LPNU", value=bool(st.session_state.filter_lpnu))
-    st.session_state.filter_tg = st.checkbox("Telegram", value=bool(st.session_state.filter_tg))
-    st.session_state.filter_vns = st.checkbox("VNS", value=bool(st.session_state.filter_vns))
-    st.session_state.filter_local = st.checkbox("Local", value=bool(st.session_state.filter_local))
+    # ==========================================================
+    # Advanced wipe
+    # ==========================================================
+    st.sidebar.divider()
+    with st.sidebar.expander("🧨 Advanced: wipe local storage", expanded=False):
+        st.caption("Видаляє local_cache.jsonl + FAISS index. Корисно для чистих тестів.")
+        confirm = st.checkbox("Я розумію що це видалить локальні дані")
+        if st.button("🗑️ Wipe local cache + index", disabled=not confirm):
+            r = _wipe_local_storage()
+            st.session_state.index_ready = False
+            st.session_state.last_results = []
+            st.session_state.last_sync_report = None
+            if r.get("ok"):
+                st.success("✅ Видалено. Тепер можна зробити Sync з нуля.")
+            else:
+                st.error("❌ Не вдалося видалити всі файли (можуть бути відкриті).")
 
+    # ==========================================================
+    # UI reset
+    # ==========================================================
+    st.sidebar.divider()
+    if st.sidebar.button("🧹 Очистити результати пошуку (UI)"):
+        st.session_state.last_results = []
+        st.session_state.last_answer_struct = None
+        st.success("Результати очищено.")
 
-# -----------------------------
-# Answer UI
-# -----------------------------
-with st.sidebar.expander("🧾 Answer UI", expanded=False):
-    st.session_state.show_used_sources_only = st.checkbox(
-        "Показувати тільки джерела, які використала відповідь",
-        value=bool(st.session_state.show_used_sources_only),
-        help="Працює найкраще з LLM, бо є цитати [1],[2]...",
-    )
-    st.session_state.show_chunk_preview = st.checkbox(
-        "Показувати прев’ю chunk’ів",
-        value=bool(st.session_state.show_chunk_preview),
-    )
-
-
-# -----------------------------
-# Reranker
-# -----------------------------
-with st.sidebar.expander("🎯 Reranker (покращення Top-K)", expanded=False):
-    if not RERANK_AVAILABLE:
-        st.warning("Reranker модуль не знайдено (`core/rerank.py`). Функція недоступна.")
-
-    st.session_state.use_reranker_ui = st.checkbox(
-        "Увімкнути Reranker",
-        value=bool(st.session_state.use_reranker_ui),
-        disabled=not RERANK_AVAILABLE,
-        help="Переранжує топ-N кандидатів для кращої точності.",
-    )
-
-    st.session_state.reranker_model_ui = st.text_input(
-        "Reranker model",
-        value=st.session_state.reranker_model_ui,
-        disabled=not (RERANK_AVAILABLE and st.session_state.use_reranker_ui),
-        help="Напр.: cross-encoder/ms-marco-MiniLM-L-6-v2",
-    )
-
-    st.session_state.reranker_top_n_ui = st.slider(
-        "Reranker candidates (top-N)",
-        min_value=10,
-        max_value=100,
-        value=int(st.session_state.reranker_top_n_ui),
-        step=5,
-        disabled=not (RERANK_AVAILABLE and st.session_state.use_reranker_ui),
-    )
-
-    st.caption("ℹ️ Reranker працює повільніше, але дає помітно кращі топ-результати.")
-
-
-# -----------------------------
-# VNS (UI only)
-# -----------------------------
-with st.sidebar.expander("🔐 ВНС (опційно, без збереження)", expanded=False):
-    st.caption(
-        "Логін і пароль зберігаються тільки в оперативній памʼяті (session_state). "
-        "Не записуються у файли."
-    )
-    st.session_state.vns_login = st.text_input("VNS login", value=st.session_state.vns_login)
-    st.session_state.vns_password = st.text_input("VNS password", value=st.session_state.vns_password, type="password")
-
-    st.write("**Зараз збережено в сесії:**")
-    st.write(f"Login: `{st.session_state.vns_login}`")
-    st.write(f"Password: `{mask_secret(st.session_state.vns_password)}`")
-
-    if st.button("🧹 Очистити VNS креденшали", use_container_width=True):
+    if st.sidebar.button("🧨 Повний скидання (очистити UI + креденшали)"):
+        st.session_state.last_results = []
+        st.session_state.last_answer_struct = None
         st.session_state.vns_login = ""
         st.session_state.vns_password = ""
-        st.success("Креденшали очищено.")
-
-
-# -----------------------------
-# Telegram (Auth + Test)
-# -----------------------------
-with st.sidebar.expander("📡 Telegram інтеграція (Auth + Sync)", expanded=False):
-    st.caption(
-        "Telethon потребує **один раз** авторизувати сесію. "
-        "Після цього ingest/sync працює без телефону та коду.\n\n"
-        "Сесія зберігається локально у файлі: `data/tg_session.session` (не комітити в Git)."
-    )
-
-    st.session_state.tg_api_id = st.text_input("Telegram API ID", value=st.session_state.tg_api_id)
-    st.session_state.tg_api_hash = st.text_input("Telegram API HASH", value=st.session_state.tg_api_hash, type="password")
-    st.session_state.tg_channels = st.text_area("Telegram channels (one per line)", value=st.session_state.tg_channels)
-
-    api_id_int = _safe_int(st.session_state.tg_api_id.strip()) if st.session_state.tg_api_id.strip() else None
-    api_hash_str = st.session_state.tg_api_hash.strip() if st.session_state.tg_api_hash.strip() else None
-
-    st.divider()
-    st.subheader("🔐 Telegram авторизація (1 раз)")
-
-    st.session_state.tg_phone = st.text_input("Телефон (+380...)", value=st.session_state.tg_phone)
-    st.session_state.tg_code = st.text_input("Код з Telegram", value=st.session_state.tg_code)
-    st.session_state.tg_2fa = st.text_input("2FA пароль (якщо увімкнено)", value=st.session_state.tg_2fa, type="password")
-
-    colA, colB = st.columns(2)
-    send_code_btn = colA.button("📨 Надіслати код", disabled=not st.session_state.online_mode)
-    sign_in_btn = colB.button("✅ Підтвердити код", disabled=not st.session_state.online_mode)
-
-    if send_code_btn:
-        if not api_id_int or not api_hash_str or not st.session_state.tg_phone.strip():
-            st.error("Вкажи api_id, api_hash і номер телефону.")
-        else:
-            try:
-                from telethon import TelegramClient
-
-                async def _send_code():
-                    async with TelegramClient("data/tg_session", api_id_int, api_hash_str) as client:
-                        await client.send_code_request(st.session_state.tg_phone.strip())
-                        return True
-
-                with st.spinner("Надсилаю код..."):
-                    _run_async(_send_code(), timeout_sec=25)
-                st.success("✅ Код надіслано. Введи код та натисни 'Підтвердити код'.")
-            except Exception as e:
-                st.error(f"❌ Не вдалося надіслати код: {e}")
-
-    if sign_in_btn:
-        if not api_id_int or not api_hash_str or not st.session_state.tg_phone.strip() or not st.session_state.tg_code.strip():
-            st.error("Вкажи api_id, api_hash, телефон і код.")
-        else:
-            try:
-                from telethon import TelegramClient
-                from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
-
-                async def _sign_in():
-                    async with TelegramClient("data/tg_session", api_id_int, api_hash_str) as client:
-                        try:
-                            await client.sign_in(phone=st.session_state.tg_phone.strip(), code=st.session_state.tg_code.strip())
-                            return {"ok": True, "msg": "✅ Авторизація успішна! Сесія збережена."}
-                        except SessionPasswordNeededError:
-                            if not st.session_state.tg_2fa.strip():
-                                return {"ok": False, "msg": "⚠️ Увімкнено 2FA. Введи пароль і повтори."}
-                            await client.sign_in(password=st.session_state.tg_2fa.strip())
-                            return {"ok": True, "msg": "✅ Авторизація успішна (2FA). Сесія збережена."}
-                        except PhoneCodeInvalidError:
-                            return {"ok": False, "msg": "❌ Невірний код."}
-
-                with st.spinner("Авторизація..."):
-                    out = _run_async(_sign_in(), timeout_sec=35)
-                if out["ok"]:
-                    st.success(out["msg"])
-                else:
-                    st.warning(out["msg"])
-            except Exception as e:
-                st.error(f"❌ Авторизація не вдалася: {e}")
-
-    st.divider()
-    st.subheader("🧪 Test Telegram (last 3 msgs)")
-
-    test_btn = st.button("🧪 Test Telegram (show last 3 msgs)", disabled=not st.session_state.online_mode)
-
-    if test_btn:
-        channels = _parse_tg_channels(st.session_state.tg_channels)
-        if not api_id_int or not api_hash_str or not channels:
-            st.error("Введи api_id, api_hash і хоча б 1 канал (наприклад pbikni).")
-        else:
-            try:
-                from telethon import TelegramClient
-
-                async def _test_channel():
-                    ch = _normalize_channel(channels[0])
-                    async with TelegramClient("data/tg_session", api_id_int, api_hash_str) as client:
-                        is_auth = await client.is_user_authorized()
-                        if not is_auth:
-                            return {"ok": False, "err": "❌ Сесія НЕ авторизована. Спочатку зроби авторизацію вище."}
-
-                        entity = await client.get_entity(ch)
-                        msgs = []
-                        async for m in client.iter_messages(entity, limit=3):
-                            txt = (getattr(m, "message", None) or "").strip()
-                            if not txt:
-                                continue
-                            msgs.append((m.id, m.date, txt))
-                        return {"ok": True, "channel": ch, "msgs": msgs}
-
-                with st.spinner("Тестую Telegram (до 25 сек)..."):
-                    out = _run_async(_test_channel(), timeout_sec=25)
-
-                if not out["ok"]:
-                    st.error(out["err"])
-                else:
-                    st.success(f"✅ Канал доступний: {out['channel']}")
-                    if not out["msgs"]:
-                        st.info("Немає текстових повідомлень у останніх 3 або вони порожні.")
-                    for mid, dt, txt in out["msgs"]:
-                        st.write(f"**{mid}** • {dt}  \n{txt}")
-
-            except Exception as e:
-                st.error(f"Telegram test failed: {e}")
-
-
-# -----------------------------
-# LLM settings
-# -----------------------------
-with st.sidebar.expander("🤖 LLM інтеграція (опційно)", expanded=False):
-    st.caption(
-        "RAG + LLM генерація. Працює через OpenAI-compatible API: OpenAI / Groq / OpenRouter / Ollama / Custom.\n"
-        "🔒 Ключ зберігається лише в session_state."
-    )
-
-    st.session_state.llm_enabled = st.checkbox(
-        "Увімкнути LLM",
-        value=bool(st.session_state.llm_enabled),
-        disabled=not st.session_state.online_mode,
-        help="Потрібен Online mode.",
-    )
-
-    provider = st.selectbox(
-        "Провайдер",
-        options=PROVIDERS,
-        index=PROVIDERS.index(st.session_state.llm_provider),
-        disabled=not st.session_state.online_mode,
-    )
-
-    if provider != st.session_state.llm_provider:
-        st.session_state.llm_provider = provider
-        st.session_state.llm_model = _provider_default_model(provider)
-
-    _ensure_valid_model_for_provider(st.session_state.llm_provider)
-
-    preset_models = MODEL_PRESETS.get(st.session_state.llm_provider, [])
-    st.session_state.use_custom_model = st.checkbox(
-        "Вказати модель вручну",
-        value=bool(st.session_state.use_custom_model),
-        disabled=not st.session_state.online_mode,
-    )
-
-    if (not st.session_state.use_custom_model) and preset_models:
-        options = preset_models[:]
-        if st.session_state.llm_model and st.session_state.llm_model not in options:
-            options = [st.session_state.llm_model] + options
-
-        selected_model = st.selectbox(
-            "Модель (вибери зі списку)",
-            options=options,
-            index=options.index(st.session_state.llm_model) if st.session_state.llm_model in options else 0,
-            disabled=not st.session_state.online_mode,
-        )
-        st.session_state.llm_model = selected_model
-    else:
-        st.session_state.llm_model = st.text_input(
-            "Модель (вручну)",
-            value=st.session_state.llm_model,
-            disabled=not st.session_state.online_mode,
-        )
-
-    st.session_state.llm_api_key = st.text_input(
-        "API Key",
-        value=st.session_state.llm_api_key,
-        type="password",
-        disabled=(not st.session_state.online_mode) or (st.session_state.llm_provider == "ollama"),
-    )
-
-    st.session_state.llm_base_url = st.text_input(
-        "Custom Base URL (тільки для custom)",
-        value=st.session_state.llm_base_url,
-        disabled=(not st.session_state.online_mode) or (st.session_state.llm_provider != "custom"),
-        help="Напр.: https://your-openai-compatible-endpoint/v1",
-    )
-
-    st.session_state.llm_temperature = st.slider(
-        "Temperature",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state.llm_temperature),
-        step=0.05,
-        disabled=not st.session_state.online_mode,
-    )
-
-    st.session_state.llm_debug = st.checkbox(
-        "Показати debug (URL + налаштування без ключа)",
-        value=bool(st.session_state.llm_debug),
-        disabled=not st.session_state.online_mode,
-    )
-
-    if st.session_state.llm_debug:
-        base_url = build_base_url(st.session_state.llm_provider, st.session_state.llm_base_url or None)
-        st.code(f"Request URL: {base_url}/chat/completions", language="text")
-
-    if st.button("🧪 Test LLM", disabled=not (st.session_state.online_mode and st.session_state.llm_enabled)):
-        llm = _build_llm_settings()
-        try:
-            test_out = chat_completion(
-                llm,
-                messages=[
-                    {"role": "system", "content": "Ти тестовий помічник."},
-                    {"role": "user", "content": "Напиши 'OK' і поточну дату у форматі YYYY-MM-DD."},
-                ],
-            )
-            st.success("✅ LLM працює!")
-            st.write(test_out)
-        except Exception as e:
-            st.error(f"LLM test failed: {e}")
-
-
-# ==========================================================
-# Index actions
-# ==========================================================
-st.sidebar.divider()
-
-if st.sidebar.button("📦 Перевірити/завантажити локальний індекс"):
-    try:
-        load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
-        st.session_state.index_ready = True
-        st.sidebar.success("FAISS індекс завантажено ✅")
-    except Exception as e:
-        st.session_state.index_ready = False
-        st.sidebar.error(f"Не знайдено індекс: {e}")
-
-if st.sidebar.button("🛠️ Побудувати індекс з local_cache.jsonl"):
-    chunks = load_chunks_from_jsonl(CONFIG.local_cache_path)
-    if not chunks:
-        st.sidebar.error(
-            "local_cache.jsonl порожній або не існує. "
-            "Натисни 'Sync knowledge base' або додай документи локально."
-        )
-    else:
-        try:
-            build_faiss_index(
-                chunks=chunks,
-                embed_model_name=CONFIG.embed_model_name,
-                index_path=CONFIG.faiss_index_path,
-                meta_path=CONFIG.faiss_meta_path,
-            )
-            st.session_state.index_ready = True
-            st.sidebar.success("Індекс успішно побудовано ✅")
-        except Exception as e:
-            st.sidebar.error(f"Помилка побудови індексу: {e}")
-
-
-# ==========================================================
-# Sync knowledge base
-# ==========================================================
-if st.sidebar.button("🔄 Sync knowledge base (LPNU + TG + rebuild index)", disabled=not st.session_state.online_mode):
-    from pipelines.sync_all import sync_all
-
-    channels = _parse_tg_channels(st.session_state.tg_channels)
-    api_id = _safe_int(st.session_state.tg_api_id.strip()) if st.session_state.tg_api_id.strip() else None
-    api_hash = st.session_state.tg_api_hash.strip() if st.session_state.tg_api_hash.strip() else None
-
-    with st.spinner("Синхронізація знань..."):
-        report = sync_all(
-            api_id=api_id,
-            api_hash=api_hash,
-            channels=channels if (api_id and api_hash and channels) else None,
-        )
-
-    st.session_state.last_sync_report = report
-    st.sidebar.success("Sync завершено ✅")
-    st.sidebar.json(report)
-    _maybe_load_index()
-
-
-# ==========================================================
-# Advanced wipe
-# ==========================================================
-st.sidebar.divider()
-with st.sidebar.expander("🧨 Advanced: wipe local storage", expanded=False):
-    st.caption("Видаляє local_cache.jsonl + FAISS index. Корисно для чистих тестів.")
-    confirm = st.checkbox("Я розумію що це видалить локальні дані")
-    if st.button("🗑️ Wipe local cache + index", disabled=not confirm):
-        r = _wipe_local_storage()
-        st.session_state.index_ready = False
-        st.session_state.last_results = []
+        st.session_state.tg_api_id = ""
+        st.session_state.tg_api_hash = ""
+        st.session_state.tg_phone = ""
+        st.session_state.tg_code = ""
+        st.session_state.tg_2fa = ""
+        st.session_state.llm_api_key = ""
         st.session_state.last_sync_report = None
-        if r.get("ok"):
-            st.success("✅ Видалено. Тепер можна зробити Sync з нуля.")
-        else:
-            st.error("❌ Не вдалося видалити всі файли (можуть бути відкриті).")
+        st.session_state.last_eval_metrics = None
+        st.session_state.last_eval_df = None
+        st.session_state.last_eval_plots_dir = None
+        st.success("Сесія очищена (без видалення файлів).")
 
+    # ==========================================================
+    # Main UI
+    # ==========================================================
+    st.title("🎓 RAG Assistant — RAG MVP (Streamlit)")
 
-# ==========================================================
-# UI reset
-# ==========================================================
-st.sidebar.divider()
-if st.sidebar.button("🧹 Очистити результати пошуку (UI)"):
-    st.session_state.last_results = []
-    st.session_state.last_answer_struct = None
-    st.success("Результати очищено.")
-
-if st.sidebar.button("🧨 Повний скидання (очистити UI + креденшали)"):
-    st.session_state.last_results = []
-    st.session_state.last_answer_struct = None
-    st.session_state.vns_login = ""
-    st.session_state.vns_password = ""
-    st.session_state.tg_api_id = ""
-    st.session_state.tg_api_hash = ""
-    st.session_state.tg_phone = ""
-    st.session_state.tg_code = ""
-    st.session_state.tg_2fa = ""
-    st.session_state.llm_api_key = ""
-    st.session_state.last_sync_report = None
-    st.session_state.last_eval_metrics = None
-    st.session_state.last_eval_df = None
-    st.session_state.last_eval_plots_dir = None
-    st.success("Сесія очищена (без видалення файлів).")
-
-
-# ==========================================================
-# Main UI
-# ==========================================================
-st.title("🎓 RAG Assistant — RAG MVP (Streamlit)")
-
-st.caption(
-    "MVP: локальний індекс + retrieval + відповідь (offline або через LLM). "
-    "Є авто-архів даних (LPNU + Wiki + Telegram) через 'Sync knowledge base'."
-)
-
-if st.session_state.online_mode:
-    st.info("🟢 ONLINE режим увімкнено — можна синхронізувати дані та використовувати LLM.")
-else:
-    st.warning("🔴 OFFLINE режим — працює тільки локальна база та індекс.")
-
-if not Path(CONFIG.faiss_index_path).exists():
-    st.warning(
-        "FAISS індекс ще не створено. Натисни **Sync knowledge base** у сайдбарі (Online mode), "
-        "щоб завантажити всі інститути ЛПНУ та побудувати індекс."
+    st.caption(
+        "MVP: локальний індекс + retrieval + відповідь (offline або через LLM). "
+        "Є авто-архів даних (LPNU + Wiki + Telegram) через 'Sync knowledge base'."
     )
 
-if Path(CONFIG.faiss_index_path).exists() and not st.session_state.index_ready:
-    _maybe_load_index()
+    if st.session_state.online_mode:
+        st.info("🟢 ONLINE режим увімкнено — можна синхронізувати дані та використовувати LLM.")
+    else:
+        st.warning("🔴 OFFLINE режим — працює тільки локальна база та індекс.")
 
-if st.session_state.last_sync_report:
-    with st.expander("📄 Останній Sync report", expanded=False):
-        st.json(st.session_state.last_sync_report)
+    if not Path(CONFIG.faiss_index_path).exists():
+        st.warning(
+            "FAISS індекс ще не створено. Натисни **Sync knowledge base** у сайдбарі (Online mode), "
+            "щоб завантажити всі інститути ЛПНУ та побудувати індекс."
+        )
 
-tab_chat, tab_eval = st.tabs(["💬 Chat / Search", "📊 Metrics & Evaluation"])
+    if Path(CONFIG.faiss_index_path).exists() and not st.session_state.index_ready:
+        _maybe_load_index()
 
-# ==========================================================
-# TAB 1: Chat / Search
-# ==========================================================
-with tab_chat:
-    st.subheader("⚡ Швидкі запити (усі інститути ЛПНУ)")
+    if st.session_state.last_sync_report:
+        with st.expander("📄 Останній Sync report", expanded=False):
+            st.json(st.session_state.last_sync_report)
 
-    qcol1, qcol2, qcol3, qcol4 = st.columns(4)
-    if qcol1.button("Керівництво інституту"):
-        st.session_state.quick_query = "Хто входить до керівництва інституту та які їх посади?"
-    if qcol2.button("Історія інституту"):
-        st.session_state.quick_query = "Коли було засновано інститут і які ключові події його історії?"
-    if qcol3.button("Освітні програми"):
-        st.session_state.quick_query = "Які бакалаврські та магістерські програми пропонує інститут?"
-    if qcol4.button("Новини університету"):
-        st.session_state.quick_query = "Останні новини та оголошення інституту"
+    tab_chat, tab_eval = st.tabs(["💬 Chat / Search", "📊 Metrics & Evaluation"])
 
-    qcol5, qcol6, qcol7, qcol8 = st.columns(4)
-    if qcol5.button("Контакти інституту"):
-        st.session_state.quick_query = "Контактна інформація викладачів та адміністрації інституту"
-    if qcol6.button("Розклад подій"):
-        st.session_state.quick_query = "Розклад лекцій, семінарів та академічних заходів інституту"
-    if qcol7.button("Гуртожитки"):
-        st.session_state.quick_query = "Інформація про гуртожитки, правила поселення та студентське життя"
-    if qcol8.button("Бібліотека та ресурси"):
-        st.session_state.quick_query = "Електронні ресурси, правила користування бібліотекою та доступ до навчальних матеріалів"
+    # ==========================================================
+    # TAB 1: Chat / Search
+    # ==========================================================
+    with tab_chat:
+        st.subheader("⚡ Швидкі запити (усі інститути ЛПНУ)")
 
-    default_query = st.session_state.get("quick_query", "")
+        qcol1, qcol2, qcol3, qcol4 = st.columns(4)
+        if qcol1.button("Керівництво інституту"):
+            st.session_state.quick_query = "Хто входить до керівництва інституту та які їх посади?"
+        if qcol2.button("Історія інституту"):
+            st.session_state.quick_query = "Коли було засновано інститут і які ключові події його історії?"
+        if qcol3.button("Освітні програми"):
+            st.session_state.quick_query = "Які бакалаврські та магістерські програми пропонує інститут?"
+        if qcol4.button("Новини університету"):
+            st.session_state.quick_query = "Останні новини та оголошення інституту"
 
-    col1, col2 = st.columns([2, 1], gap="large")
+        qcol5, qcol6, qcol7, qcol8 = st.columns(4)
+        if qcol5.button("Контакти інституту"):
+            st.session_state.quick_query = "Контактна інформація викладачів та адміністрації інституту"
+        if qcol6.button("Розклад подій"):
+            st.session_state.quick_query = "Розклад лекцій, семінарів та академічних заходів інституту"
+        if qcol7.button("Гуртожитки"):
+            st.session_state.quick_query = "Інформація про гуртожитки, правила поселення та студентське життя"
+        if qcol8.button("Бібліотека та ресурси"):
+            st.session_state.quick_query = "Електронні ресурси, правила користування бібліотекою та доступ до навчальних матеріалів"
 
-    with col1:
-        st.subheader("🔎 Запит")
+        default_query = st.session_state.get("quick_query", "")
 
-        query = st.text_input("Введи питання", value=default_query)
-        top_k = st.slider("Top-K джерел", min_value=1, max_value=10, value=int(CONFIG.top_k))
+        col1, col2 = st.columns([2, 1], gap="large")
 
-        use_llm = bool(st.session_state.online_mode and st.session_state.llm_enabled)
+        with col1:
+            st.subheader("🔎 Запит")
 
-        if use_llm:
-            st.caption(
-                f"🤖 Генерація: **LLM ON** • provider=`{st.session_state.llm_provider}` • model=`{st.session_state.llm_model}`"
-            )
-        else:
-            st.caption("📌 Генерація: **LLM OFF** (offline summarizer)")
+            query = st.text_input("Введи питання", value=default_query)
+            top_k = st.slider("Top-K джерел", min_value=1, max_value=10, value=int(CONFIG.top_k))
 
-        if st.session_state.use_reranker_ui and RERANK_AVAILABLE:
-            st.caption(
-                f"🎯 Reranker: **ON** • model=`{st.session_state.reranker_model_ui}` • topN={st.session_state.reranker_top_n_ui}"
-            )
-        else:
-            st.caption("🎯 Reranker: **OFF**")
+            use_llm = bool(st.session_state.online_mode and st.session_state.llm_enabled)
 
-        ask_btn = st.button("Отримати відповідь", type="primary", use_container_width=True)
-
-        if ask_btn:
-            st.session_state.quick_query = ""
-            st.session_state.last_query = query
-
-            if not query.strip():
-                st.warning("Введи запит.")
-            elif not st.session_state.index_ready:
-                st.warning("Спершу завантаж або побудуй локальний FAISS індекс у сайдбарі.")
+            if use_llm:
+                st.caption(
+                    f"🤖 Генерація: **LLM ON** • provider=`{st.session_state.llm_provider}` • model=`{st.session_state.llm_model}`"
+                )
             else:
-                from core.index import search_index
+                st.caption("📌 Генерація: **LLM OFF** (offline summarizer)")
 
-                index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
-
-                internal_k = max(
-                    getattr(CONFIG, "internal_k_min", 30),
-                    top_k * getattr(CONFIG, "internal_k_multiplier", 8),
+            if st.session_state.use_reranker_ui and RERANK_AVAILABLE:
+                st.caption(
+                    f"🎯 Reranker: **ON** • model=`{st.session_state.reranker_model_ui}` • topN={st.session_state.reranker_top_n_ui}"
                 )
+            else:
+                st.caption("🎯 Reranker: **OFF**")
+            st.caption(f"🧩 Extraction: **{'ON' if st.session_state.use_structured_extraction else 'OFF'}**")
+            st.caption(f"🏛️ Institute filter: **{'ON' if st.session_state.use_institute_filter else 'OFF'}**")
+            st.caption(f"🛡️ Rules: **{'ON' if st.session_state.use_semantic_rules else 'OFF'}**")
 
-                # raw candidates
-                candidates = search_index(
-                    query=query,
-                    index=index,
-                    chunks=meta,
-                    embed_model_name=CONFIG.embed_model_name,
-                    top_k=top_k,
-                    internal_k=internal_k,
-                    min_score=float(st.session_state.min_score),
-                    keyword_filter=bool(st.session_state.keyword_filter),
-                )
+            ask_btn = st.button("Отримати відповідь", type="primary", use_container_width=True)
 
-                # ---------------------------------------
-                # Source type filter
-                # ---------------------------------------
-                allowed_types = set()
-                if st.session_state.filter_lpnu:
-                    allowed_types.add("lpnu")
-                if st.session_state.filter_tg:
-                    allowed_types.add("tg")
-                if st.session_state.filter_vns:
-                    allowed_types.add("vns")
-                if st.session_state.filter_local:
-                    allowed_types.add("local")
+            if ask_btn:
+                st.session_state.quick_query = ""
+                st.session_state.last_query = query
 
-                filtered_candidates = [
-                    (ch, sc) for (ch, sc) in candidates
-                    if (ch.source_type or "").lower() in allowed_types
-                ]
-                if not filtered_candidates:
-                    filtered_candidates = candidates
+                if not query.strip():
+                    st.warning("Введи запит.")
+                elif not st.session_state.index_ready:
+                    st.warning("Спершу завантаж або побудуй локальний FAISS індекс у сайдбарі.")
+                else:
+                    index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
 
-                # ---------------------------------------
-                # Document scope filter (local uploads)
-                # ---------------------------------------
-                if st.session_state.doc_scope_enabled and st.session_state.doc_scope_ids:
-                    scoped = []
-                    allowed_doc_ids = set(st.session_state.doc_scope_ids)
+                    allowed_types = set()
+                    if st.session_state.filter_lpnu:
+                        allowed_types.add("lpnu")
+                    if st.session_state.filter_tg:
+                        allowed_types.add("tg")
+                    if st.session_state.filter_vns:
+                        allowed_types.add("vns")
+                    if st.session_state.filter_local:
+                        allowed_types.add("local")
 
-                    for ch, sc in filtered_candidates:
-                        extra = ch.extra or {}
-                        doc_id = extra.get("doc_id")
-                        if doc_id and doc_id in allowed_doc_ids:
-                            scoped.append((ch, sc))
+                    allowed_doc_ids = None
+                    if st.session_state.doc_scope_enabled and st.session_state.doc_scope_ids:
+                        allowed_doc_ids = set(st.session_state.doc_scope_ids)
 
-                    if scoped:
-                        filtered_candidates = scoped
-
-                # ---------------------------------------
-                # Rerank (optional)
-                # ---------------------------------------
-                if st.session_state.use_reranker_ui and RERANK_AVAILABLE:
-                    results = rerank_results(
+                    llm = _build_llm_settings() if use_llm else None
+                    ans, bundle = answer_query(
                         query=query,
-                        results=filtered_candidates[: int(st.session_state.reranker_top_n_ui)],
-                        model_name=st.session_state.reranker_model_ui,
-                        top_k=top_k,
+                        index=index,
+                        chunks=meta,
+                        embed_model_name=CONFIG.embed_model_name,
+                        llm=llm,
+                        min_score=float(st.session_state.min_score),
+                        keyword_filter=bool(st.session_state.keyword_filter),
+                        allowed_types=allowed_types or None,
+                        allowed_doc_ids=allowed_doc_ids,
+                        use_reranker=bool(st.session_state.use_reranker_ui and RERANK_AVAILABLE),
+                        reranker_model=st.session_state.reranker_model_ui,
+                        reranker_top_n=int(st.session_state.reranker_top_n_ui),
+                        top_k_override=top_k,
+                        use_extraction=bool(st.session_state.use_structured_extraction),
+                        use_institute_filter=bool(st.session_state.use_institute_filter),
+                        use_rules=bool(st.session_state.use_semantic_rules),
                     )
-                    ranking_mode = "reranker"
-                else:
-                    results = filtered_candidates[:top_k]
-                    ranking_mode = "faiss"
 
-                st.session_state.last_results = results
+                    results = bundle.context_results or bundle.results
+                    st.session_state.last_results = results
+                    ranking_mode = "adaptive_hybrid_reranker" if (st.session_state.use_reranker_ui and RERANK_AVAILABLE) else "adaptive_hybrid"
 
-                # ---------------------------------------
-                # Answer
-                # ---------------------------------------
-                if use_llm:
-                    llm = _build_llm_settings()
-                    ans = make_answer_with_llm_struct(query, results, llm)
-                else:
-                    ans = make_answer_no_llm_struct(query, results)
+                    st.session_state.last_answer_struct = ans
 
-                st.session_state.last_answer_struct = ans
+                    st.markdown(ans.markdown, unsafe_allow_html=True)
 
-                st.markdown(ans.markdown, unsafe_allow_html=True)
+                    if getattr(ans, "warnings", None):
+                        st.warning(" | ".join(ans.warnings))
 
-                if getattr(ans, "warnings", None):
-                    st.warning(" | ".join(ans.warnings))
+                    st.divider()
+                    st.markdown("### 👍👎 Feedback")
 
-                st.divider()
-                st.markdown("### 👍👎 Feedback")
+                    comment = st.text_input("Коментар (опційно)", key="feedback_comment")
 
-                comment = st.text_input("Коментар (опційно)", key="feedback_comment")
+                    c1, c2, _ = st.columns([1, 1, 3])
+                    good = c1.button("👍 Добре", use_container_width=True)
+                    bad = c2.button("👎 Погано", use_container_width=True)
 
-                c1, c2, _ = st.columns([1, 1, 3])
-                good = c1.button("👍 Добре", use_container_width=True)
-                bad = c2.button("👎 Погано", use_container_width=True)
+                    if good or bad:
+                        rating = +1 if good else -1
+                        payload = _feedback_payload(rating=rating, comment=st.session_state.get("feedback_comment", ""))
+                        _append_feedback(payload)
+                        st.success("✅ Дякую! Фідбек збережено.")
+                        st.session_state.feedback_comment = ""
 
-                if good or bad:
-                    rating = +1 if good else -1
-                    payload = _feedback_payload(rating=rating, comment=st.session_state.get("feedback_comment", ""))
-                    _append_feedback(payload)
-                    st.success("✅ Дякую! Фідбек збережено.")
-                    st.session_state.feedback_comment = ""
+                    if st.session_state.show_retrieval_debug:
+                        with st.expander("🧪 Retrieval debug", expanded=False):
+                            st.write(
+                                {
+                                    "question_type": bundle.analysis.question_type,
+                                    "expanded_query": bundle.analysis.expanded_query,
+                                    "adaptive_top_k": bundle.analysis.adaptive_top_k,
+                                    "candidates_after_search": len(bundle.candidates),
+                                    "context_results": len(bundle.context_results),
+                                    "top_k_returned": len(results),
+                                    "ranking_mode": ranking_mode,
+                                    "min_score": float(st.session_state.min_score),
+                                    "keyword_filter": bool(st.session_state.keyword_filter),
+                                    "allowed_types": sorted(list(allowed_types)),
+                                    "doc_scope_enabled": bool(st.session_state.doc_scope_enabled),
+                                    "doc_scope_ids": sorted(list(st.session_state.doc_scope_ids or [])),
+                                    "use_structured_extraction": bool(st.session_state.use_structured_extraction),
+                                    "use_institute_filter": bool(st.session_state.use_institute_filter),
+                                    "use_rules": bool(st.session_state.use_semantic_rules),
+                                    "query_institute": bundle.analysis.institute_code,
+                                    "detected_intent": bundle.analysis.intent,
+                                    "entity_scope": bundle.analysis.entity_scope,
+                                    "used_sources": getattr(ans, "used_sources", []),
+                                    "warnings": getattr(ans, "warnings", []),
+                                }
+                            )
+                            st.markdown("**Query**")
+                            st.code(query, language="text")
+                            if bundle.entity_candidates:
+                                st.markdown("**Extracted candidates (entity-level)**")
+                                st.dataframe(pd.DataFrame(bundle.entity_candidates), use_container_width=True, hide_index=True)
+                            else:
+                                st.info("No entity candidates extracted for this query.")
+                            if getattr(bundle, "accepted_candidates", None):
+                                st.markdown("**Accepted candidates**")
+                                st.dataframe(pd.DataFrame(bundle.accepted_candidates), use_container_width=True, hide_index=True)
+                            if getattr(bundle, "rejected_candidates", None):
+                                st.markdown("**Rejected candidates (with reasons)**")
+                                st.dataframe(pd.DataFrame(bundle.rejected_candidates), use_container_width=True, hide_index=True)
+                            st.markdown("**Retrieved chunks**")
+                            debug_rows = []
+                            for rank, (chunk, score) in enumerate(results, start=1):
+                                debug_rows.append(
+                                    {
+                                        "rank": rank,
+                                        "score": round(float(score), 4),
+                                        "title": chunk.title,
+                                        "type": chunk.source_type,
+                                        "url": chunk.url,
+                                        "snippet": (chunk.text[:160] + "...") if len(chunk.text) > 160 else chunk.text,
+                                    }
+                                )
+                            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
+                            st.markdown("**Selected answer**")
+                            st.code(ans.answer_text or "", language="text")
+                            st.markdown("**Confidence**")
+                            st.code(ans.confidence, language="text")
+                            st.markdown("**Final decision**")
+                            st.code(getattr(bundle, "final_decision", ""), language="text")
 
-                if st.session_state.show_retrieval_debug:
-                    with st.expander("🧪 Retrieval debug", expanded=False):
-                        st.write(
-                            {
-                                "internal_k_candidates": internal_k,
-                                "candidates_after_search": len(candidates),
-                                "filtered_candidates": len(filtered_candidates),
-                                "top_k_returned": len(results),
-                                "ranking_mode": ranking_mode,
-                                "min_score": float(st.session_state.min_score),
-                                "keyword_filter": bool(st.session_state.keyword_filter),
-                                "allowed_types": sorted(list(allowed_types)),
-                                "doc_scope_enabled": bool(st.session_state.doc_scope_enabled),
-                                "doc_scope_ids": sorted(list(st.session_state.doc_scope_ids or [])),
-                                "used_sources": getattr(ans, "used_sources", []),
-                                "warnings": getattr(ans, "warnings", []),
-                            }
-                        )
+        with col2:
+            st.subheader("📚 Джерела")
 
-    with col2:
-        st.subheader("📚 Джерела")
+            if not st.session_state.last_results:
+                st.info("Після запиту тут зʼявляться знайдені фрагменти (top-K).")
+            else:
+                ans = st.session_state.last_answer_struct
+                used = set(getattr(ans, "used_sources", []) or []) if ans else set()
 
-        if not st.session_state.last_results:
-            st.info("Після запиту тут зʼявляться знайдені фрагменти (top-K).")
-        else:
-            ans = st.session_state.last_answer_struct
-            used = set(getattr(ans, "used_sources", []) or []) if ans else set()
-
-            rows = []
-            for rank, (chunk, score) in enumerate(st.session_state.last_results, start=1):
-                if st.session_state.show_used_sources_only and used and (rank not in used):
-                    continue
-
-                rows.append(
-                    {
-                        "Rank": rank,
-                        "Used": "✅" if (rank in used) else "",
-                        "Score": round(float(score), 4),
-                        "Title": chunk.title,
-                        "Type": chunk.source_type,
-                        "Date": chunk.date,
-                        "URL": chunk.url,
-                        "DocID": (chunk.extra or {}).get("doc_id"),
-                        "Text (snippet)": (chunk.text[:180] + "…") if len(chunk.text) > 180 else chunk.text,
-                    }
-                )
-
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-            if st.session_state.show_chunk_preview:
-                st.markdown("#### 🔍 Повний текст chunk’ів")
+                rows = []
                 for rank, (chunk, score) in enumerate(st.session_state.last_results, start=1):
                     if st.session_state.show_used_sources_only and used and (rank not in used):
                         continue
 
-                    label = f"[{rank}] {chunk.title} ({chunk.source_type}) score={score:.3f}"
-                    with st.expander(label, expanded=False):
-                        if chunk.url:
-                            st.write(chunk.url)
-                        if chunk.date:
-                            st.write(chunk.date)
+                    rows.append(
+                        {
+                            "Rank": rank,
+                            "Used": "✅" if (rank in used) else "",
+                            "Score": round(float(score), 4),
+                            "Institute": ((chunk.extra or {}).get("institute_code") or "").upper() or "N/A",
+                            "Title": chunk.title,
+                            "Type": chunk.source_type,
+                            "Date": chunk.date,
+                            "URL": chunk.url,
+                            "DocID": (chunk.extra or {}).get("doc_id"),
+                            "Text (snippet)": (chunk.text[:180] + "…") if len(chunk.text) > 180 else chunk.text,
+                        }
+                    )
 
-                        extra = chunk.extra or {}
-                        if extra.get("doc_id"):
-                            st.caption(f"doc_id: `{extra.get('doc_id')}`")
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    grouped = df.sort_values(["Institute", "Rank"]).groupby("Institute", sort=False)
+                    for institute, gdf in grouped:
+                        st.markdown(f"**{institute}**")
+                        st.dataframe(gdf.head(2), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Немає джерел для показу.")
 
-                        st.write(chunk.text)
+                if st.session_state.show_chunk_preview:
+                    st.markdown("#### 🔍 Повний текст chunk’ів")
+                    for rank, (chunk, score) in enumerate(st.session_state.last_results, start=1):
+                        if st.session_state.show_used_sources_only and used and (rank not in used):
+                            continue
+
+                        label = f"[{rank}] {chunk.title} ({chunk.source_type}) score={score:.3f}"
+                        with st.expander(label, expanded=False):
+                            if chunk.url:
+                                st.write(chunk.url)
+                            if chunk.date:
+                                st.write(chunk.date)
+
+                            extra = chunk.extra or {}
+                            if extra.get("doc_id"):
+                                st.caption(f"doc_id: `{extra.get('doc_id')}`")
+
+                            st.write(chunk.text)
+
+else:
+    st.sidebar.title("⚡ Простий режим")
+
+    st.session_state.online_mode = st.sidebar.toggle(
+        "Online",
+        value=bool(st.session_state.online_mode),
+    )
+
+    st.session_state.llm_enabled = True
+
+    # дефолти щоб система працювала стабільно
+    st.session_state.min_score = 0.2
+    st.session_state.keyword_filter = False
+    st.session_state.use_reranker_ui = True
+    st.session_state.reranker_top_n_ui = 20
+
+    st.sidebar.caption("Все працює автоматично 👌")
+
+if mode == "LIGHT":
+    st.title("💬 RAG Assistant")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # показ історії
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    prompt = st.chat_input("Напиши питання...")
+
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Думаю..."):
+
+                index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
+                allowed_types = {"lpnu", "tg", "vns", "local"}
+                llm = _build_llm_settings() if st.session_state.online_mode else None
+                ans, bundle = answer_query(
+                    query=prompt,
+                    index=index,
+                    chunks=meta,
+                    embed_model_name=CONFIG.embed_model_name,
+                    llm=llm,
+                    min_score=0.2,
+                    keyword_filter=False,
+                    allowed_types=allowed_types,
+                    use_reranker=bool(RERANK_AVAILABLE),
+                    reranker_model=st.session_state.reranker_model_ui,
+                    reranker_top_n=20,
+                    top_k_override=5,
+                    use_extraction=bool(st.session_state.use_structured_extraction),
+                    use_institute_filter=bool(st.session_state.use_institute_filter),
+                    use_rules=bool(st.session_state.use_semantic_rules),
+                )
+
+                st.markdown(ans.markdown)
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": ans.markdown
+        })
+
+    st.stop()  # 🚨 ЗУПИНЯЄ виконання, щоб PRO UI не рендерився
 
 
 # ==========================================================
@@ -1442,6 +1477,37 @@ with tab_eval:
             else:
                 st.error(out.get("error", "Evaluation failed."))
 
+    if st.button("⚖️ Compare without/with institute filter"):
+        if not st.session_state.index_ready:
+            st.error("Спершу завантаж/побудуй індекс.")
+        elif not Path("eval_set.jsonl").exists():
+            st.error("Файл `eval_set.jsonl` не знайдено.")
+        else:
+            with st.spinner("Запускаю два прогони evaluation..."):
+                out_off = run_retrieval_eval(top_k=eval_k, use_reranker=use_reranker_eval, use_institute_filter=False)
+                out_on = run_retrieval_eval(top_k=eval_k, use_reranker=use_reranker_eval, use_institute_filter=True)
+            if out_off.get("ok") and out_on.get("ok"):
+                compare_df = pd.DataFrame(
+                    [
+                        {
+                            "mode": "without_institute_filter",
+                            "Recall@K": out_off["metrics"].get("recall_at_k", 0.0),
+                            "Hit@1": out_off["metrics"].get("hit_at_1", 0.0),
+                            "Exact Match": out_off["metrics"].get("exact_match", 0.0),
+                            "F1": out_off["metrics"].get("f1", 0.0),
+                        },
+                        {
+                            "mode": "with_institute_filter",
+                            "Recall@K": out_on["metrics"].get("recall_at_k", 0.0),
+                            "Hit@1": out_on["metrics"].get("hit_at_1", 0.0),
+                            "Exact Match": out_on["metrics"].get("exact_match", 0.0),
+                            "F1": out_on["metrics"].get("f1", 0.0),
+                        },
+                    ]
+                )
+                st.markdown("### Institute-aware impact")
+                st.dataframe(compare_df, use_container_width=True, hide_index=True)
+
     if st.session_state.last_eval_metrics:
         m = st.session_state.last_eval_metrics
         c1, c2, c3, c4 = st.columns(4)
@@ -1460,6 +1526,14 @@ with tab_eval:
         c6.metric("Hit@3", f"{m.get('hit_at_3', 0.0):.3f}")
         c7.metric("Hit@5", f"{m.get('hit_at_5', 0.0):.3f}")
         c8.metric("Top1 mean", f"{m.get('top1_score_mean'):.3f}" if m.get("top1_score_mean") is not None else "—")
+
+        c9, c10 = st.columns(2)
+        c9.metric("Exact Match", f"{m.get('exact_match', 0.0):.3f}")
+        c10.metric("F1", f"{m.get('f1', 0.0):.3f}")
+        c11, c12, c13 = st.columns(3)
+        c11.metric("Invalid role", str(m.get("invalid_role_answers", 0)))
+        c12.metric("Wrong institute", str(m.get("wrong_institute_answers", 0)))
+        c13.metric("Hallucinations", str(m.get("hallucinations", 0)))
 
     if isinstance(st.session_state.last_eval_df, pd.DataFrame):
         st.markdown("### 📋 Evaluation table")
@@ -1481,6 +1555,7 @@ with tab_eval:
 
     st.divider()
     st.subheader("⚙️ Embedding & Parameter Tuning (Safe Sweep)")
+    st.caption("Для коректного порівняння різних embedding-моделей краще запускати `scripts/run_diploma_experiments.py`, бо він перебудовує індекс під кожну модель окремо.")
 
     if st.button("🧪 Run embedding + parameter sweep (optimized)"):
         # Менші chunk_sizes для безпечного sweep

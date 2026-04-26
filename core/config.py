@@ -18,7 +18,7 @@ class AppConfig:
 
     # ✅ Reranker
     use_reranker: bool = False
-    reranker_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    reranker_model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     reranker_top_n: int = 30
 
     internal_k_min: int = 30

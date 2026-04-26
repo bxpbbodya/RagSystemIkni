@@ -1,66 +1,83 @@
-# pipelines/sync_all_optimized.py
 from __future__ import annotations
+
 import asyncio
-from typing import Dict, Any, List, Optional
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from core.config import CONFIG
 from core.index import build_faiss_index, load_chunks_from_jsonl
-from core.ingest_utils import make_chunks_from_doc, append_jsonl, existing_chunk_ids, now_iso_date
-
-from pipelines.ingest_lpnu import AsyncCrawler, ingest_lpnu_async
 from pipelines.ingest_telegram import ingest_telegram_channel
+from pipelines.ingest_vns import ingest_vns_exports
+
+LPNU_CHUNK_SIZE = 180
+LPNU_OVERLAP = 50
+TELEGRAM_CHUNK_SIZE = 500
+TELEGRAM_OVERLAP = 80
+VNS_CHUNK_SIZE = 420
+VNS_OVERLAP = 90
 
 
 # -----------------------------
-# LPNU Sync via AsyncCrawler
+# LPNU Sync
 # -----------------------------
-async def _sync_lpnu_async() -> Dict[str, Any]:
-    print("Starting LPNU crawl + ingest...")
-    crawler = AsyncCrawler(
-        start_url="https://lpnu.ua",
-        max_pages=100,
-        max_depth=2,
-        concurrency=5
-    )
-    pages = await crawler.run()
+async def _sync_lpnu() -> Dict[str, Any]:
+    print("[LPNU] Starting crawl + ingest...")
+    try:
+        from pipelines.ingest_lpnu import _ensure_lpnu_ingest_deps, ingest_lpnu_async
 
-    if not pages:
-        return {"ok": False, "added_chunks": 0, "processed_urls": 0, "chunks": [], "errors": ["No pages crawled"]}
-
-    existing_ids = existing_chunk_ids(CONFIG.local_cache_path)
-    added_chunks = 0
-    all_chunks = []
-
-    for url, title, text in pages:
-        doc_id = f"lpnu::{url}"
-        chunks = make_chunks_from_doc(
-            source_type="lpnu",
-            url=url,
-            title=title,
-            raw_text=text,
-            date=now_iso_date(),
-            extra={"origin": "lpnu", "doc_id": doc_id},
-            chunk_size=900,
-            overlap=120,
-            doc_id=doc_id
+        _ensure_lpnu_ingest_deps()
+        result = await ingest_lpnu_async(
+            seed_urls=None,
+            cache_path=CONFIG.local_cache_path,
+            chunk_size=LPNU_CHUNK_SIZE,
+            overlap=LPNU_OVERLAP,
         )
+        added_chunks = result.get("added_chunks", 0)
+        total_pages = result.get("total_pages_crawled", 0)
+        print(f"[LPNU] Added {added_chunks} chunks from {total_pages} pages")
+        return {
+            "ok": added_chunks > 0,
+            "added_chunks": added_chunks,
+            "processed_urls": total_pages,
+            "pages_added": result.get("pages_added", []),
+            "pages_skipped": result.get("pages_skipped", []),
+            "chunks": [],
+            "errors": [],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "added_chunks": 0,
+            "processed_urls": 0,
+            "pages_added": [],
+            "pages_skipped": [],
+            "chunks": [],
+            "errors": [str(e)],
+        }
 
-        to_add = []
-        for ch in chunks:
-            if ch.chunk_id in existing_ids:
-                continue
-            existing_ids.add(ch.chunk_id)
-            to_add.append(ch.__dict__)
-            all_chunks.append(ch.__dict__)
 
-        if to_add:
-            append_jsonl(CONFIG.local_cache_path, to_add)
-            added_chunks += len(to_add)
+# -----------------------------
+# VNS Sync (local exports)
+# -----------------------------
+def _sync_vns(export_dir: str | Path = "data/vns_exports") -> Dict[str, Any]:
+    export_dir = Path(export_dir)
+    if not export_dir.exists():
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": f"Directory not found: {export_dir}",
+            "added_chunks": 0,
+            "processed_files": 0,
+            "errors": [],
+        }
 
-        print(f"[LPNU CHUNKS] {url} -> {len(to_add)} added")
-
-    return {"ok": added_chunks > 0, "added_chunks": added_chunks, "processed_urls": len(pages), "chunks": all_chunks, "errors": []}
+    result = ingest_vns_exports(
+        export_dir=export_dir,
+        cache_path=CONFIG.local_cache_path,
+        chunk_size=VNS_CHUNK_SIZE,
+        overlap=VNS_OVERLAP,
+    )
+    return result
 
 
 # -----------------------------
@@ -72,7 +89,7 @@ async def _sync_telegram(
     channels: List[str],
     limit: int = 300,
     since_days: Optional[int] = 120,
-    session_name: str = "data/tg_session"
+    session_name: str = "data/tg_session",
 ) -> List[Dict[str, Any]]:
     results = []
     for ch in channels:
@@ -84,9 +101,9 @@ async def _sync_telegram(
                 cache_path=CONFIG.local_cache_path,
                 limit=limit,
                 since_days=since_days,
-                chunk_size=600,
-                overlap=80,
-                session_name=session_name
+                chunk_size=TELEGRAM_CHUNK_SIZE,
+                overlap=TELEGRAM_OVERLAP,
+                session_name=session_name,
             )
             added = len(r.get("chunks", []))
             errors = r.get("errors", [])
@@ -101,20 +118,24 @@ async def _sync_telegram(
 # -----------------------------
 # FAISS Index Rebuild
 # -----------------------------
-def rebuild_index(chunks: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def rebuild_index(chunks: Optional[List[Any]] = None) -> Dict[str, Any]:
     if chunks is None:
         chunks = load_chunks_from_jsonl(CONFIG.local_cache_path)
     if not chunks:
         return {"ok": False, "error": "No chunks in cache. Run sync first."}
 
-    print(f"Rebuilding FAISS index with {len(chunks)} chunks...")
+    quality_chunks = [ch for ch in chunks if len((ch.text or "").split()) >= 20]
+    if not quality_chunks:
+        return {"ok": False, "error": "No quality chunks available after filtering."}
+
+    print(f"[INDEX] Rebuilding FAISS index with {len(quality_chunks)} chunks...")
     index, _ = build_faiss_index(
-        chunks=chunks,
+        chunks=quality_chunks,
         embed_model_name=CONFIG.embed_model_name,
         index_path=CONFIG.faiss_index_path,
-        meta_path=CONFIG.faiss_meta_path
+        meta_path=CONFIG.faiss_meta_path,
     )
-    return {"ok": True, "chunks_indexed": len(chunks), "index_size": int(index.ntotal)}
+    return {"ok": True, "chunks_indexed": len(quality_chunks), "index_size": int(index.ntotal)}
 
 
 # -----------------------------
@@ -139,60 +160,64 @@ def sync_all(
     channels: Optional[List[str]] = None,
     tg_limit: int = 300,
     tg_since_days: Optional[int] = 120,
-    tg_session_name: str = "data/tg_session"
+    tg_session_name: str = "data/tg_session",
 ) -> Dict[str, Any]:
     report: Dict[str, Any] = {}
 
-    # LPNU
-    try:
-        lpnu_result = _safe_asyncio_run(_sync_lpnu_async())
-        report["lpnu"] = lpnu_result
-    except Exception as e:
-        report["lpnu"] = {"ok": False, "added_chunks": 0, "processed_urls": 0, "chunks": [], "errors": [str(e)]}
+    async def run_all():
+        tasks = [_sync_lpnu()]
+        if api_id and api_hash and channels:
+            tasks.append(_sync_telegram(api_id, api_hash, channels, tg_limit, tg_since_days, tg_session_name))
+        return await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Telegram
-    tg_result: List[Dict[str, Any]] = []
-    if api_id and api_hash and channels:
-        tg_result = _safe_asyncio_run(_sync_telegram(api_id, api_hash, channels, tg_limit, tg_since_days, tg_session_name))
-        report["telegram"] = tg_result
-    else:
+    results = _safe_asyncio_run(run_all())
+
+    lpnu_result = results[0] if len(results) > 0 else {
+        "ok": False,
+        "added_chunks": 0,
+        "processed_urls": 0,
+        "pages_added": [],
+        "pages_skipped": [],
+        "chunks": [],
+        "errors": ["Unknown error"],
+    }
+    report["lpnu"] = lpnu_result
+
+    tg_result = results[1] if len(results) > 1 else []
+    if isinstance(tg_result, Exception):
+        report["telegram"] = {"ok": False, "added_chunks": 0, "errors": [str(tg_result)], "chunks": []}
+    elif tg_result == []:
         report["telegram"] = {"skipped": True, "reason": "No api_id/api_hash/channels provided"}
+    else:
+        report["telegram"] = tg_result
 
-    # Merge all chunks for FAISS
-    all_chunks = []
-    if lpnu_result.get("chunks"):
-        all_chunks.extend(lpnu_result["chunks"])
-    if isinstance(tg_result, list):
-        for r in tg_result:
-            if r.get("chunks"):
-                all_chunks.extend(r["chunks"])
+    report["vns"] = _sync_vns()
 
-    # Rebuild FAISS index
+    all_chunks = load_chunks_from_jsonl(CONFIG.local_cache_path)
     try:
         report["index"] = rebuild_index(all_chunks)
     except Exception as e:
         report["index"] = {"ok": False, "error": str(e)}
 
-    # Summary
-    total_added = len(all_chunks)
     total_errors = len(lpnu_result.get("errors", []))
     if isinstance(tg_result, list):
         for r in tg_result:
             total_errors += len(r.get("errors", []))
+    total_errors += len(report["vns"].get("errors", []))
 
     report["summary"] = {
-        "total_added_chunks": total_added,
+        "total_chunks_in_cache": len(all_chunks),
+        "lpnu_added_chunks": lpnu_result.get("added_chunks", 0),
+        "lpnu_processed_urls": lpnu_result.get("processed_urls", 0),
+        "vns_added_chunks": report["vns"].get("added_chunks", 0),
         "total_errors": total_errors,
-        "index_ok": report.get("index", {}).get("ok", False)
+        "index_ok": report.get("index", {}).get("ok", False),
     }
 
     print(f"[SYNC SUMMARY] {report['summary']}")
     return report
 
 
-# -----------------------------
-# Example
-# -----------------------------
 if __name__ == "__main__":
     print("Starting full sync...")
     stats = sync_all()

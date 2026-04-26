@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.venv311
 .env
 
 # Streamlit
@@ -13,6 +14,8 @@ venv/
 
 # Data / caches
 data/
+pipelines/data
+pipelines/report
 report/
 *.faiss
 *.jsonl
