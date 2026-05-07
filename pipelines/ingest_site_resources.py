@@ -131,7 +131,15 @@ def ingest_resources(
             continue
 
         doc_id = f"lpnu_resource::{url}"
-        extra = {"origin": "lpnu_resource", "doc_id": doc_id, "seed_url": url}
+        extra = {
+            "origin": "lpnu_resource",
+            "doc_id": doc_id,
+            "seed_url": url,
+            "source_trust": 0.86,
+            "content_type": "html",
+            "word_count_est": len(text.split()),
+            "version": now_iso_date(),
+        }
 
         chunks = make_chunks_from_doc(
             source_type="lpnu_resource",

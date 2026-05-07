@@ -11,6 +11,10 @@ class AppConfig:
     local_cache_path: Path = BASE_DIR / "data" / "local_cache.jsonl"
     faiss_index_path: Path = BASE_DIR / "data" / "index.faiss"
     faiss_meta_path: Path = BASE_DIR / "data" / "index_meta.jsonl"
+    report_dir: Path = BASE_DIR / "report"
+    benchmark_dir: Path = BASE_DIR / "report" / "benchmarks"
+    expanded_eval_path: Path = BASE_DIR / "report" / "eval_expanded.jsonl"
+    self_improve_report_path: Path = BASE_DIR / "report" / "self_improve_report.json"
 
     # Embeddings
     embed_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"

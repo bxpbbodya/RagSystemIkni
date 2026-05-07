@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -77,6 +78,15 @@ PERSON_BOOST_TERMS = ("директор", "ректор", "керівництв�
 LOCATION_BOOST_TERMS = ("адреса", "вул.", "вулиця", "корпус", "кабінет", "аудитор", "розташований", "знаходиться")
 CONTACT_BOOST_TERMS = ("телефон", "email", "e-mail", "пошта", "контакти")
 
+SOURCE_TRUST_WEIGHTS: Dict[str, float] = {
+    "local": 0.98,
+    "vns": 0.95,
+    "lpnu": 0.92,
+    "resource": 0.86,
+    "lpnu_resource": 0.86,
+    "tg": 0.68,
+}
+
 NAME_RE = r"[А-ЯІЇЄҐ][а-яіїєґ'’\-]+(?:\s+[А-ЯІЇЄҐ][а-яіїєґ'’\-]+){1,2}"
 ADDRESS_RE = r"(?:вул\.?|вулиця|м\.)\s*[А-ЯІЇЄҐA-Z0-9][^,\n]{2,90}(?:,\s*\d+[А-Яа-яA-Za-z/]*)?"
 
@@ -121,6 +131,28 @@ class RetrievalBundle:
     accepted_candidates: List[Dict[str, Any]] = field(default_factory=list)
     rejected_candidates: List[Dict[str, Any]] = field(default_factory=list)
     final_decision: str = ""
+    timings: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AnswerQueryConfig:
+    embed_model_name: str
+    min_score: float = 0.2
+    keyword_filter: bool = False
+    allowed_types: Optional[Tuple[str, ...]] = None
+    allowed_doc_ids: Optional[Tuple[str, ...]] = None
+    use_reranker: bool = False
+    reranker_model: Optional[str] = None
+    reranker_top_n: int = 20
+    use_query_expansion: bool = True
+    use_adaptive_top_k: bool = True
+    use_hybrid: bool = True
+    top_k_override: Optional[int] = None
+    use_post_boosts: bool = True
+    use_extraction: bool = True
+    use_institute_filter: bool = True
+    use_rules: bool = True
+    llm: Optional[LLMSettings] = None
 
 
 # --- Допоміжні функції ---
@@ -180,6 +212,17 @@ def _attach_institute_metadata(chunk: SourceChunk) -> SourceChunk:
         extra["institute_name"] = name
     chunk.extra = extra
     return chunk
+
+
+def source_trust_score(chunk: SourceChunk) -> float:
+    extra = chunk.extra or {}
+    explicit = extra.get("source_trust")
+    if explicit is not None:
+        try:
+            return float(explicit)
+        except Exception:
+            pass
+    return SOURCE_TRUST_WEIGHTS.get((chunk.source_type or "").lower(), 0.72)
 
 
 # --- Основна Логіка Аналізу та Пошуку ---
@@ -322,6 +365,7 @@ def _post_retrieval_score(analysis: QueryAnalysis, chunk: SourceChunk, score: fl
 
     preferred_bonus = analysis.preferred_sources.get((chunk.source_type or "").lower(), 0.0)
     boosted += preferred_bonus
+    boosted += max(source_trust_score(chunk) - 0.7, 0.0) * 0.1
     return boosted
 
 
@@ -461,6 +505,8 @@ def retrieve_for_query(
         use_extraction: bool = True,
         use_institute_filter: bool = True,
 ) -> RetrievalBundle:
+    timings: Dict[str, float] = {}
+    started_at = time.perf_counter()
     analysis = analyze_query_with_options(
         query,
         use_query_expansion=use_query_expansion,
@@ -468,6 +514,7 @@ def retrieve_for_query(
     )
 
     requested_top_k = top_k_override or analysis.adaptive_top_k
+    retrieval_started = time.perf_counter()
     candidates = search_index(
         query=analysis.expanded_query,
         index=index,
@@ -480,11 +527,13 @@ def retrieve_for_query(
         use_hybrid=use_hybrid,
         use_query_boosts=use_post_boosts,
     )
+    timings["search_ms"] = round((time.perf_counter() - retrieval_started) * 1000.0, 3)
 
     if allowed_types:
         candidates = filter_results(candidates, allowed_types=allowed_types)
 
     if not candidates:
+        fallback_started = time.perf_counter()
         candidates = search_index(
             query=analysis.expanded_query,
             index=index,
@@ -497,6 +546,7 @@ def retrieve_for_query(
             use_hybrid=use_hybrid,
             use_query_boosts=use_post_boosts,
         )
+        timings["fallback_search_ms"] = round((time.perf_counter() - fallback_started) * 1000.0, 3)
 
     if allowed_doc_ids:
         candidates = filter_results(candidates, allowed_doc_ids=allowed_doc_ids)
@@ -517,6 +567,7 @@ def retrieve_for_query(
     rescored = _dedupe_by_url(rescored)
 
     if use_reranker and reranker_model:
+        rerank_started = time.perf_counter()
         rerank_pool = rescored[: max(reranker_top_n, requested_top_k * 4)]
         results = rerank_results(
             query=analysis.expanded_query,
@@ -524,8 +575,10 @@ def retrieve_for_query(
             model_name=reranker_model,
             top_k=requested_top_k,
         )
+        timings["rerank_ms"] = round((time.perf_counter() - rerank_started) * 1000.0, 3)
     else:
         results = rescored[: requested_top_k]
+        timings["rerank_ms"] = 0.0
 
     results = _dedupe_by_url(results)
 
@@ -536,15 +589,21 @@ def retrieve_for_query(
         context_results=[],
         extraction=None,
         entity_candidates=[],
+        timings=timings,
     )
     bundle.context_results = clean_context_results(bundle)
 
     if use_extraction:
+        extraction_started = time.perf_counter()
         bundle.extraction = extract_answer_before_llm(query, bundle.context_results, analysis)
+        bundle.timings["extraction_ms"] = round((time.perf_counter() - extraction_started) * 1000.0, 3)
+    else:
+        bundle.timings["extraction_ms"] = 0.0
 
     if analysis.question_type == "person":
         bundle.entity_candidates = _extract_person_candidates(query, bundle.context_results, analysis)
 
+    bundle.timings["total_retrieval_ms"] = round((time.perf_counter() - started_at) * 1000.0, 3)
     return bundle
 
 
@@ -881,6 +940,39 @@ def extract_answer_before_llm(
 
 
 # --- Основна функція відповіді ---
+
+def answer_query_with_config(
+        *,
+        query: str,
+        index: faiss.Index,
+        chunks: List[SourceChunk],
+        config: AnswerQueryConfig,
+) -> Tuple[RAGAnswer, RetrievalBundle]:
+    allowed_types = set(config.allowed_types) if config.allowed_types else None
+    allowed_doc_ids = set(config.allowed_doc_ids) if config.allowed_doc_ids else None
+    return answer_query(
+        query=query,
+        index=index,
+        chunks=chunks,
+        embed_model_name=config.embed_model_name,
+        llm=config.llm,
+        min_score=config.min_score,
+        keyword_filter=config.keyword_filter,
+        allowed_types=allowed_types,
+        allowed_doc_ids=allowed_doc_ids,
+        use_reranker=config.use_reranker,
+        reranker_model=config.reranker_model,
+        reranker_top_n=config.reranker_top_n,
+        use_query_expansion=config.use_query_expansion,
+        use_adaptive_top_k=config.use_adaptive_top_k,
+        use_hybrid=config.use_hybrid,
+        top_k_override=config.top_k_override,
+        use_post_boosts=config.use_post_boosts,
+        use_extraction=config.use_extraction,
+        use_institute_filter=config.use_institute_filter,
+        use_rules=config.use_rules,
+    )
+
 
 def answer_query(
         *,

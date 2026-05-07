@@ -6,8 +6,10 @@ from typing import Any, Dict, List, Optional
 
 from core.config import CONFIG
 from core.index import build_faiss_index, load_chunks_from_jsonl
+from core.kb_validation import validate_local_knowledge_base
 from pipelines.ingest_telegram import ingest_telegram_channel
 from pipelines.ingest_vns import ingest_vns_exports
+from pipelines.ingest_site_resources import RESOURCE_URLS, ingest_resources
 
 LPNU_CHUNK_SIZE = 180
 LPNU_OVERLAP = 50
@@ -15,6 +17,8 @@ TELEGRAM_CHUNK_SIZE = 500
 TELEGRAM_OVERLAP = 80
 VNS_CHUNK_SIZE = 420
 VNS_OVERLAP = 90
+RESOURCE_CHUNK_SIZE = 420
+RESOURCE_OVERLAP = 80
 
 
 # -----------------------------
@@ -78,6 +82,15 @@ def _sync_vns(export_dir: str | Path = "data/vns_exports") -> Dict[str, Any]:
         overlap=VNS_OVERLAP,
     )
     return result
+
+
+def _sync_site_resources() -> Dict[str, Any]:
+    return ingest_resources(
+        RESOURCE_URLS,
+        CONFIG.local_cache_path,
+        chunk_size=RESOURCE_CHUNK_SIZE,
+        overlap=RESOURCE_OVERLAP,
+    )
 
 
 # -----------------------------
@@ -192,24 +205,30 @@ def sync_all(
         report["telegram"] = tg_result
 
     report["vns"] = _sync_vns()
+    report["resources"] = _sync_site_resources()
 
     all_chunks = load_chunks_from_jsonl(CONFIG.local_cache_path)
     try:
         report["index"] = rebuild_index(all_chunks)
     except Exception as e:
         report["index"] = {"ok": False, "error": str(e)}
+    report["kb_validation"] = validate_local_knowledge_base(CONFIG.local_cache_path)
 
     total_errors = len(lpnu_result.get("errors", []))
     if isinstance(tg_result, list):
         for r in tg_result:
             total_errors += len(r.get("errors", []))
     total_errors += len(report["vns"].get("errors", []))
+    total_errors += len(report["resources"].get("errors", []))
 
     report["summary"] = {
         "total_chunks_in_cache": len(all_chunks),
         "lpnu_added_chunks": lpnu_result.get("added_chunks", 0),
         "lpnu_processed_urls": lpnu_result.get("processed_urls", 0),
         "vns_added_chunks": report["vns"].get("added_chunks", 0),
+        "resource_added_chunks": report["resources"].get("added_chunks", 0),
+        "eval_target_covered": report["kb_validation"].get("eval_target_covered", 0),
+        "eval_target_total": report["kb_validation"].get("eval_target_total", 0),
         "total_errors": total_errors,
         "index_ok": report.get("index", {}).get("ok", False),
     }

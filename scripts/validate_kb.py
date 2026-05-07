@@ -14,7 +14,12 @@ from core.kb_validation import validate_local_knowledge_base
 
 def main() -> None:
     report = validate_local_knowledge_base(CONFIG.local_cache_path, eval_set_path="eval_set.jsonl")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    text = json.dumps(report, ensure_ascii=False, indent=2)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        print(text)
+    except Exception:
+        sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="replace"))
 
 
 if __name__ == "__main__":

@@ -282,7 +282,9 @@ def main() -> None:
 
         for llm_name, llm_settings in llm_variants_to_run:
             experiment_name = experiment.name if not llm_name else f"{experiment.name}_{slugify(llm_name)}"
-            config = PipelineConfig(**{**experiment.__dict__, "name": experiment_name})
+            config_payload = {**experiment.__dict__, "name": experiment_name}
+            config_payload["use_generation"] = bool(llm_settings and experiment.use_generation)
+            config = PipelineConfig(**config_payload)
             print(f"[RUN] {config.name}")
             metrics, details = run_pipeline_evaluation(
                 eval_set=eval_set,

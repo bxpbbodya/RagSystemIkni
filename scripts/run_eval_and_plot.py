@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,21 @@ if str(ROOT_DIR) not in sys.path:
 from core.config import CONFIG
 from core.evaluation import PipelineConfig, load_eval_set, run_pipeline_evaluation
 from core.index import load_faiss_index
+from core.llm import LLMSettings
+
+
+def build_llm_from_env() -> LLMSettings | None:
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_key:
+        return None
+    return LLMSettings(
+        enabled=True,
+        provider="openai",
+        model=os.getenv("EVAL_LLM_MODEL", "gpt-4o-mini"),
+        api_key=openai_key,
+        temperature=0.0,
+        max_tokens=180,
+    )
 
 
 def main() -> None:
@@ -21,20 +37,19 @@ def main() -> None:
         raise SystemExit("eval_set.jsonl not found or empty.")
 
     index, chunks = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
+    llm = build_llm_from_env()
     config = PipelineConfig(
-        name="single_eval_pipeline",
+        name="eval_production_like",
         embed_model=CONFIG.embed_model_name,
         top_k=5,
         use_hybrid=True,
         use_post_boosts=True,
-        use_reranker=False,
+        use_reranker=True,
         use_query_expansion=True,
-        use_adaptive_top_k=True,
-        use_generation=False,
+        use_generation=bool(llm and llm.enabled),
         use_extraction=True,
-        use_rules=True,
-        keyword_filter=False,
-        min_score=0.2,
+        min_score=0.15,
+        keyword_filter=True,
     )
 
     metrics, details = run_pipeline_evaluation(
@@ -42,7 +57,7 @@ def main() -> None:
         index=index,
         chunks=chunks,
         config=config,
-        llm=None,
+        llm=llm,
     )
 
     report_dir = Path("report")

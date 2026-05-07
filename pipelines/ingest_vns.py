@@ -164,7 +164,17 @@ def ingest_vns_exports(
             continue
 
         title = path.stem.replace("_", " ").replace("-", " ").strip()
-        extra = {"origin": "vns_export", "doc_id": doc_id, "relative_path": rel}
+        stat = path.stat()
+        extra = {
+            "origin": "vns_export",
+            "doc_id": doc_id,
+            "relative_path": rel,
+            "content_type": path.suffix.lower().lstrip("."),
+            "source_trust": 0.95,
+            "version": int(stat.st_mtime),
+            "file_modified_at": stat.st_mtime,
+            "word_count_est": len(raw_text.split()),
+        }
         chunks = make_chunks_from_doc(
             source_type="vns",
             url=f"vns://{rel}",

@@ -212,6 +212,7 @@ async def ingest_telegram_channel(
                     "channel": channel_norm,
                     "msg_id": msg.id,
                     "message_key": mk,
+                    "source_trust": 0.68,
                     "views": getattr(msg, "views", None),
                     "forwards": getattr(msg, "forwards", None),
                     "replies": getattr(getattr(msg, "replies", None), "replies", None),

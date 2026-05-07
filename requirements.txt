@@ -27,6 +27,7 @@ telethon==1.36.0
 # Plots
 matplotlib>=3.8
 rouge-score>=0.1.2
+bert-score>=0.3.13
 
 # PDF ingest (PyMuPDF -> fitz)
 pymupdf==1.24.9

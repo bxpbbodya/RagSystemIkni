@@ -20,7 +20,7 @@ from core.index import load_faiss_index, build_faiss_index, load_chunks_from_jso
 from core.security import mask_secret
 from core.llm import LLMSettings, chat_completion, build_base_url
 
-from core.query_pipeline import answer_query
+from core.query_pipeline import AnswerQueryConfig, answer_query_with_config
 
 # Optional reranker
 try:
@@ -239,6 +239,10 @@ def _init_state():
         "last_eval_metrics": None,
         "last_eval_df": None,
         "last_eval_plots_dir": None,
+        "last_benchmark_summary": None,
+        "last_benchmark_details": None,
+        "last_kb_validation": None,
+        "last_self_improve_report": None,
     }
 
     for k, v in defaults.items():
@@ -299,6 +303,52 @@ def _build_llm_settings() -> LLMSettings:
         base_url=(st.session_state.llm_base_url or "").strip() or None,
         temperature=float(st.session_state.llm_temperature),
         max_tokens=650,
+    )
+
+
+def _current_allowed_types() -> Optional[Tuple[str, ...]]:
+    allowed_types = []
+    if st.session_state.filter_lpnu:
+        allowed_types.append("lpnu")
+    if st.session_state.filter_tg:
+        allowed_types.append("tg")
+    if st.session_state.filter_vns:
+        allowed_types.append("vns")
+    if st.session_state.filter_local:
+        allowed_types.append("local")
+    return tuple(allowed_types) if allowed_types else None
+
+
+def _current_allowed_doc_ids() -> Optional[Tuple[str, ...]]:
+    if st.session_state.doc_scope_enabled and st.session_state.doc_scope_ids:
+        return tuple(sorted(st.session_state.doc_scope_ids))
+    return None
+
+
+def _build_current_query_config(
+    *,
+    top_k: int,
+    llm: Optional[LLMSettings],
+    use_institute_filter: Optional[bool] = None,
+) -> AnswerQueryConfig:
+    return AnswerQueryConfig(
+        embed_model_name=CONFIG.embed_model_name,
+        min_score=float(st.session_state.min_score),
+        keyword_filter=bool(st.session_state.keyword_filter),
+        allowed_types=_current_allowed_types(),
+        allowed_doc_ids=_current_allowed_doc_ids(),
+        use_reranker=bool(st.session_state.use_reranker_ui and RERANK_AVAILABLE),
+        reranker_model=st.session_state.reranker_model_ui,
+        reranker_top_n=int(st.session_state.reranker_top_n_ui),
+        use_query_expansion=True,
+        use_adaptive_top_k=True,
+        use_hybrid=True,
+        top_k_override=int(top_k),
+        use_post_boosts=True,
+        use_extraction=bool(st.session_state.use_structured_extraction),
+        use_institute_filter=bool(st.session_state.use_institute_filter if use_institute_filter is None else use_institute_filter),
+        use_rules=bool(st.session_state.use_semantic_rules),
+        llm=llm,
     )
 
 
@@ -480,29 +530,37 @@ def run_retrieval_eval(top_k: int = 5, use_reranker: bool = False, use_institute
         return {"ok": False, "error": "eval_set.jsonl not found or empty."}
 
     index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
+    llm = _build_llm_settings() if (st.session_state.online_mode and st.session_state.llm_enabled) else None
+    base_query_config = _build_current_query_config(
+        top_k=top_k,
+        llm=llm,
+        use_institute_filter=use_institute_filter,
+    )
     config = PipelineConfig(
         name="app_eval_pipeline",
-        embed_model=CONFIG.embed_model_name,
+        embed_model=base_query_config.embed_model_name,
         top_k=top_k,
-        use_hybrid=True,
+        allowed_types=base_query_config.allowed_types,
+        use_hybrid=base_query_config.use_hybrid,
+        use_post_boosts=base_query_config.use_post_boosts,
         use_reranker=bool(use_reranker and RERANK_AVAILABLE),
         reranker_model=st.session_state.reranker_model_ui if (use_reranker and RERANK_AVAILABLE) else None,
-        reranker_top_n=int(st.session_state.reranker_top_n_ui),
-        use_query_expansion=True,
-        use_adaptive_top_k=True,
-        use_generation=False,
-        use_extraction=bool(st.session_state.use_structured_extraction),
-        use_institute_filter=bool(use_institute_filter),
-        use_rules=bool(st.session_state.use_semantic_rules),
-        keyword_filter=bool(st.session_state.keyword_filter),
-        min_score=float(st.session_state.min_score),
+        reranker_top_n=base_query_config.reranker_top_n,
+        use_query_expansion=base_query_config.use_query_expansion,
+        use_adaptive_top_k=base_query_config.use_adaptive_top_k,
+        use_generation=bool(llm and llm.enabled),
+        use_extraction=base_query_config.use_extraction,
+        use_institute_filter=base_query_config.use_institute_filter,
+        use_rules=base_query_config.use_rules,
+        keyword_filter=base_query_config.keyword_filter,
+        min_score=base_query_config.min_score,
     )
     metrics, df = run_pipeline_evaluation(
         eval_set=eval_set,
         index=index,
         chunks=meta,
         config=config,
-        llm=None,
+        llm=llm,
     )
     metrics["mode"] = "adaptive_hybrid_reranker" if (use_reranker and RERANK_AVAILABLE) else "adaptive_hybrid"
     metrics["min_score"] = float(st.session_state.min_score)
@@ -1126,7 +1184,7 @@ if mode == "PRO":
         with st.expander("📄 Останній Sync report", expanded=False):
             st.json(st.session_state.last_sync_report)
 
-    tab_chat, tab_eval = st.tabs(["💬 Chat / Search", "📊 Metrics & Evaluation"])
+    tab_chat, tab_eval, tab_research = st.tabs(["💬 Chat / Search", "📊 Metrics & Evaluation", "🧪 Research & Ops"])
 
     # ==========================================================
     # TAB 1: Chat / Search
@@ -1196,38 +1254,13 @@ if mode == "PRO":
                 else:
                     index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
 
-                    allowed_types = set()
-                    if st.session_state.filter_lpnu:
-                        allowed_types.add("lpnu")
-                    if st.session_state.filter_tg:
-                        allowed_types.add("tg")
-                    if st.session_state.filter_vns:
-                        allowed_types.add("vns")
-                    if st.session_state.filter_local:
-                        allowed_types.add("local")
-
-                    allowed_doc_ids = None
-                    if st.session_state.doc_scope_enabled and st.session_state.doc_scope_ids:
-                        allowed_doc_ids = set(st.session_state.doc_scope_ids)
-
                     llm = _build_llm_settings() if use_llm else None
-                    ans, bundle = answer_query(
+                    query_config = _build_current_query_config(top_k=top_k, llm=llm)
+                    ans, bundle = answer_query_with_config(
                         query=query,
                         index=index,
                         chunks=meta,
-                        embed_model_name=CONFIG.embed_model_name,
-                        llm=llm,
-                        min_score=float(st.session_state.min_score),
-                        keyword_filter=bool(st.session_state.keyword_filter),
-                        allowed_types=allowed_types or None,
-                        allowed_doc_ids=allowed_doc_ids,
-                        use_reranker=bool(st.session_state.use_reranker_ui and RERANK_AVAILABLE),
-                        reranker_model=st.session_state.reranker_model_ui,
-                        reranker_top_n=int(st.session_state.reranker_top_n_ui),
-                        top_k_override=top_k,
-                        use_extraction=bool(st.session_state.use_structured_extraction),
-                        use_institute_filter=bool(st.session_state.use_institute_filter),
-                        use_rules=bool(st.session_state.use_semantic_rules),
+                        config=query_config,
                     )
 
                     results = bundle.context_results or bundle.results
@@ -1270,7 +1303,7 @@ if mode == "PRO":
                                     "ranking_mode": ranking_mode,
                                     "min_score": float(st.session_state.min_score),
                                     "keyword_filter": bool(st.session_state.keyword_filter),
-                                    "allowed_types": sorted(list(allowed_types)),
+                                    "allowed_types": sorted(list(query_config.allowed_types or [])),
                                     "doc_scope_enabled": bool(st.session_state.doc_scope_enabled),
                                     "doc_scope_ids": sorted(list(st.session_state.doc_scope_ids or [])),
                                     "use_structured_extraction": bool(st.session_state.use_structured_extraction),
@@ -1415,24 +1448,30 @@ if mode == "LIGHT":
             with st.spinner("Думаю..."):
 
                 index, meta = load_faiss_index(CONFIG.faiss_index_path, CONFIG.faiss_meta_path)
-                allowed_types = {"lpnu", "tg", "vns", "local"}
                 llm = _build_llm_settings() if st.session_state.online_mode else None
-                ans, bundle = answer_query(
-                    query=prompt,
-                    index=index,
-                    chunks=meta,
+                light_config = AnswerQueryConfig(
                     embed_model_name=CONFIG.embed_model_name,
-                    llm=llm,
                     min_score=0.2,
                     keyword_filter=False,
-                    allowed_types=allowed_types,
+                    allowed_types=("lpnu", "tg", "vns", "local"),
                     use_reranker=bool(RERANK_AVAILABLE),
                     reranker_model=st.session_state.reranker_model_ui,
                     reranker_top_n=20,
+                    use_query_expansion=True,
+                    use_adaptive_top_k=True,
+                    use_hybrid=True,
                     top_k_override=5,
+                    use_post_boosts=True,
                     use_extraction=bool(st.session_state.use_structured_extraction),
                     use_institute_filter=bool(st.session_state.use_institute_filter),
                     use_rules=bool(st.session_state.use_semantic_rules),
+                    llm=llm,
+                )
+                ans, bundle = answer_query_with_config(
+                    query=prompt,
+                    index=index,
+                    chunks=meta,
+                    config=light_config,
                 )
 
                 st.markdown(ans.markdown)
@@ -1527,17 +1566,43 @@ with tab_eval:
         c7.metric("Hit@5", f"{m.get('hit_at_5', 0.0):.3f}")
         c8.metric("Top1 mean", f"{m.get('top1_score_mean'):.3f}" if m.get("top1_score_mean") is not None else "—")
 
-        c9, c10 = st.columns(2)
-        c9.metric("Exact Match", f"{m.get('exact_match', 0.0):.3f}")
-        c10.metric("F1", f"{m.get('f1', 0.0):.3f}")
-        c11, c12, c13 = st.columns(3)
+        c8b, c8c, c8d = st.columns(3)
+        c8b.metric("MAP@K", f"{m.get('map_at_k', 0.0):.3f}")
+        c8c.metric("nDCG@K", f"{m.get('ndcg_at_k', 0.0):.3f}")
+        c8d.metric("Grounding", f"{m.get('grounding_score'):.3f}" if m.get("grounding_score") is not None else "N/A")
+
+        c9, c10, c10b = st.columns(3)
+        exact_match_value = m.get("exact_match")
+        f1_value = m.get("f1")
+        c9.metric("Exact Match", f"{exact_match_value:.3f}" if exact_match_value is not None else "N/A")
+        c10.metric("F1", f"{f1_value:.3f}" if f1_value is not None else "N/A")
+        c10b.metric("Semantic F1", f"{m.get('semantic_f1'):.3f}" if m.get("semantic_f1") is not None else "N/A")
+        c11, c12, c13, c14 = st.columns(4)
         c11.metric("Invalid role", str(m.get("invalid_role_answers", 0)))
         c12.metric("Wrong institute", str(m.get("wrong_institute_answers", 0)))
         c13.metric("Hallucinations", str(m.get("hallucinations", 0)))
+        c14.metric("Answer refs", f"{m.get('answer_metric_count', 0)}/{m.get('answer_metric_count', 0) + m.get('answer_metric_skipped', 0)}")
+        c15, c16, c17, c18 = st.columns(4)
+        c15.metric("Source trust", f"{m.get('source_confidence'):.3f}" if m.get("source_confidence") is not None else "N/A")
+        c16.metric("Citation ok", f"{m.get('citation_correctness'):.3f}" if m.get("citation_correctness") is not None else "N/A")
+        c17.metric("Latency ms", f"{m.get('avg_latency_ms', 0.0):.1f}")
+        c18.metric("Est. cost USD", f"{m.get('estimated_cost_usd'):.4f}" if m.get("estimated_cost_usd") is not None else "N/A")
 
     if isinstance(st.session_state.last_eval_df, pd.DataFrame):
         st.markdown("### 📋 Evaluation table")
         st.dataframe(st.session_state.last_eval_df, use_container_width=True, hide_index=True)
+
+    diploma_summary_path = Path("report/diploma/diploma_summary.csv")
+    if diploma_summary_path.exists():
+        st.markdown("### 🏆 Diploma leaderboard")
+        try:
+            diploma_df = pd.read_csv(diploma_summary_path)
+            sort_columns = [col for col in ["hit_at_1", "mrr_at_k", "exact_match", "f1"] if col in diploma_df.columns]
+            if sort_columns:
+                diploma_df = diploma_df.sort_values(sort_columns, ascending=False)
+            st.dataframe(diploma_df.head(15), use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.warning(f"Не вдалося прочитати leaderboard: {exc}")
 
     # ==========================================================
     # Button: Test multiple embeddings and parameters (optimized)
@@ -1664,6 +1729,104 @@ with tab_eval:
                     bad_df = df_fb[df_fb["rating"] == -1]
                     st.caption(f"Bad queries: {len(bad_df)}")
                     st.dataframe(bad_df, use_container_width=True, hide_index=True)
+
+
+# ==========================================================
+# TAB 3: Research & Ops
+# ==========================================================
+with tab_research:
+    st.subheader("🧪 Research & Ops")
+    st.write("Benchmark suite, expanded evaluation, self-improvement loop, validation та аналіз помилок для дипломного захисту.")
+
+    research_top_k = st.slider("Benchmark Top-K", min_value=1, max_value=10, value=5, key="research_top_k")
+    research_min_score = st.slider("Benchmark min_score", min_value=0.0, max_value=0.6, value=float(st.session_state.min_score), step=0.05, key="research_min_score")
+
+    r1, r2, r3, r4 = st.columns(4)
+    if r1.button("Run benchmark suite", use_container_width=True):
+        if not st.session_state.index_ready:
+            st.error("Спершу побудуй або завантаж індекс.")
+        else:
+            from core.benchmarking import run_benchmark_suite
+
+            llm = _build_llm_settings() if (st.session_state.online_mode and st.session_state.llm_enabled) else None
+            with st.spinner("Запускаю benchmark suite..."):
+                bench = run_benchmark_suite(
+                    embed_model=CONFIG.embed_model_name,
+                    reranker_model=st.session_state.reranker_model_ui,
+                    top_k=int(research_top_k),
+                    min_score=float(research_min_score),
+                    llm=llm,
+                    allowed_types=_current_allowed_types(),
+                )
+            st.session_state.last_benchmark_summary = bench["summary"]
+            st.session_state.last_benchmark_details = bench["details"]
+            st.success(f"Benchmark suite завершено: {bench['run_dir']}")
+
+    if r2.button("Validate KB", use_container_width=True):
+        from core.kb_validation import validate_local_knowledge_base
+
+        report = validate_local_knowledge_base(CONFIG.local_cache_path)
+        st.session_state.last_kb_validation = report
+        st.success("Knowledge base validation завершено.")
+
+    if r3.button("Build large eval set", use_container_width=True):
+        from core.eval_dataset import expand_eval_dataset
+
+        report = expand_eval_dataset(output_path=CONFIG.expanded_eval_path)
+        st.session_state.last_self_improve_report = {"expanded_eval_only": report}
+        st.success(f"Expanded eval set створено: {report['expanded_examples']} прикладів.")
+
+    if r4.button("Self Improve", use_container_width=True):
+        from core.self_improve import run_self_improve
+
+        with st.spinner("Збираю hard cases, розширюю eval set та оновлюю індекс..."):
+            report = run_self_improve(
+                reindex=True,
+                expanded_eval_output=CONFIG.expanded_eval_path,
+                report_path=CONFIG.self_improve_report_path,
+            )
+        st.session_state.last_self_improve_report = report
+        st.success("Self-improve pipeline завершено.")
+
+    st.divider()
+    st.markdown("### Benchmark history")
+    try:
+        from core.benchmarking import load_benchmark_history
+
+        history_df = load_benchmark_history(CONFIG.benchmark_dir)
+        if not history_df.empty:
+            st.dataframe(history_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Історія benchmark runs поки порожня.")
+    except Exception as exc:
+        st.warning(f"Не вдалося прочитати benchmark history: {exc}")
+
+    if isinstance(st.session_state.last_benchmark_summary, pd.DataFrame):
+        st.markdown("### Last benchmark leaderboard")
+        st.dataframe(st.session_state.last_benchmark_summary, use_container_width=True, hide_index=True)
+    if isinstance(st.session_state.last_benchmark_details, pd.DataFrame):
+        st.markdown("### Last benchmark failure analysis")
+        failure_df = st.session_state.last_benchmark_details
+        if "exact_match" in failure_df.columns:
+            failure_df = failure_df[failure_df["exact_match"].fillna(0) < 1.0]
+        st.dataframe(failure_df.head(100), use_container_width=True, hide_index=True)
+
+    if st.session_state.last_kb_validation:
+        st.markdown("### Knowledge base validation")
+        st.json(st.session_state.last_kb_validation)
+
+    if st.session_state.last_self_improve_report:
+        st.markdown("### Self-improve report")
+        st.json(st.session_state.last_self_improve_report)
+
+    eval_errors_path = Path("report/eval_errors.jsonl")
+    if eval_errors_path.exists():
+        st.markdown("### Failure cases viewer")
+        error_rows = safe_read_jsonl(eval_errors_path, limit=200)
+        if error_rows:
+            st.dataframe(pd.DataFrame(error_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Поки немає помилок для показу.")
 
 
 # ==========================================================
